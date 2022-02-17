@@ -7,4 +7,6 @@ edition = "2021"
 
 [dependencies]
 pulldown-cmark = { version = "0.9.1", default-features = false, features = ["simd"] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
 tokio = { version = "1.17", default-features = false, features = ["rt-multi-thread", "macros", "fs", "io-std"] }
+toml = "0.5"
