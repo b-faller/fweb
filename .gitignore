@@ -1,6 +1,7 @@
 /target
 
 # Site content
+_site
+config.toml
 pages
 templates
-_site

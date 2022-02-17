@@ -1,8 +1,11 @@
 use pulldown_cmark::{html, Options, Parser};
 use serde::{Deserialize, Serialize};
 use std::io;
-use std::path::PathBuf;
 use std::{fs, path::Path};
+
+mod config;
+
+use crate::config::{Config, Site};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PageMetadata {
@@ -46,7 +49,7 @@ async fn parse_page(path: &Path) -> io::Result<Page> {
     Ok(page)
 }
 
-async fn read_pages_template(pages_dir: &Path) -> io::Result<()> {
+async fn read_pages_template(pages_dir: impl AsRef<Path>, site: &Site) -> io::Result<()> {
     let mut pages = Vec::new();
     for entry in fs::read_dir(pages_dir)? {
         let path = entry?.path();
@@ -68,21 +71,30 @@ async fn read_pages_template(pages_dir: &Path) -> io::Result<()> {
             page.metadata.id, page.content
         );
     }
-    let template_output = template_input.replace("%%% sections %%%", &sections_html);
+    let output = template_input.replace("%%% sections %%%", &sections_html);
 
     let nav_html = pages
         .iter()
         .map(|p| format!("<a href=\"#{}\">{}</a>\n", p.metadata.id, p.metadata.title))
         .collect::<String>();
-    let template_output = template_output.replace("%%% nav %%%", &nav_html);
-    fs::write("_site/index.html", template_output)?;
+    let output = output.replace("%%% nav %%%", &nav_html);
+
+    let output = output.replace("%%% site_title %%%", &site.title);
+    let output = output.replace("%%% site_description %%%", &site.description);
+    fs::write("_site/index.html", output)?;
 
     Ok(())
 }
 
+async fn read_config(path: impl AsRef<Path>) -> io::Result<Config> {
+    let content = fs::read_to_string(path)?;
+    let config = toml::from_str(&content)?;
+    Ok(config)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let pages_dir = PathBuf::from("pages");
-    read_pages_template(&pages_dir).await?;
+    let config = read_config("config.toml").await?;
+    read_pages_template("pages", &config.site).await?;
     Ok(())
 }
