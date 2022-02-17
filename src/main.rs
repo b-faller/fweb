@@ -1,7 +1,7 @@
 use pulldown_cmark::{html, Options, Parser};
 use serde::{Deserialize, Serialize};
 use std::io;
-use std::{fs, path::Path};
+use std::path::Path;
 
 mod config;
 
@@ -20,7 +20,7 @@ struct Page {
 }
 
 async fn parse_page(path: &Path) -> io::Result<Page> {
-    let input = fs::read_to_string(path)?;
+    let input = tokio::fs::read_to_string(path).await?;
     let mut split = input.splitn(3, "+++");
 
     // Empty before frontmatter
@@ -49,20 +49,33 @@ async fn parse_page(path: &Path) -> io::Result<Page> {
     Ok(page)
 }
 
-async fn read_pages_template(pages_dir: impl AsRef<Path>, site: &Site) -> io::Result<()> {
-    let mut pages = Vec::new();
-    for entry in fs::read_dir(pages_dir)? {
-        let path = entry?.path();
+async fn handle_pages(pages_dir: impl AsRef<Path>) -> io::Result<Vec<Page>> {
+    let mut pages = vec![];
+    let mut handles = vec![];
+
+    let mut entries = tokio::fs::read_dir(pages_dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
         if path.is_file() {
-            let html_output = parse_page(&path).await?;
-            pages.push(html_output);
+            handles.push(tokio::spawn(async move { parse_page(&path).await }));
         }
     }
 
+    for handle in handles {
+        let page = handle.await??;
+        pages.push(page);
+    }
+
+    Ok(pages)
+}
+
+async fn read_pages_template(pages_dir: impl AsRef<Path>, site: &Site) -> io::Result<()> {
+    let pages = handle_pages(pages_dir).await?;
+
     // FIXME: Error handling if directory fails not because it already exists
-    fs::create_dir("_site").ok();
-    fs::copy("templates/style.css", "_site/style.css")?;
-    let template_input = fs::read_to_string("templates/index.html")?;
+    tokio::fs::create_dir("_site").await.ok();
+    tokio::fs::copy("templates/style.css", "_site/style.css").await?;
+    let template_input = tokio::fs::read_to_string("templates/index.html").await?;
 
     let mut sections_html = String::new();
     for page in &pages {
@@ -81,20 +94,25 @@ async fn read_pages_template(pages_dir: impl AsRef<Path>, site: &Site) -> io::Re
 
     let output = output.replace("%%% site_title %%%", &site.title);
     let output = output.replace("%%% site_description %%%", &site.description);
-    fs::write("_site/index.html", output)?;
+    tokio::fs::write("_site/index.html", output).await?;
 
     Ok(())
 }
 
 async fn read_config(path: impl AsRef<Path>) -> io::Result<Config> {
-    let content = fs::read_to_string(path)?;
+    let content = tokio::fs::read_to_string(path).await?;
     let config = toml::from_str(&content)?;
     Ok(config)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let it = std::time::Instant::now();
+
     let config = read_config("config.toml").await?;
     read_pages_template("pages", &config.site).await?;
+
+    print!("{:?}\n", it.elapsed());
+
     Ok(())
 }
