@@ -293,9 +293,8 @@ async fn try_main() -> Result<()> {
     // Get website config
     let config_path = PathBuf::from(
         std::env::args()
-            .skip(1)
-            .next()
-            .unwrap_or("config.toml".into()),
+            .nth(1)
+            .unwrap_or_else(|| "config.toml".into()),
     );
     let config = read_site_config(&config_path)
         .await
