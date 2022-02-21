@@ -156,9 +156,11 @@ async fn handle_posts(posts_dir: impl AsRef<Path>) -> io::Result<Vec<Post>> {
 
     for handle in handles {
         let page = handle.await??;
-
         posts.push(page);
     }
+
+    // Sort posts based on their date descending.
+    posts.sort_by(|p1, p2| p2.metadata.date.cmp(&p1.metadata.date));
 
     Ok(posts)
 }
