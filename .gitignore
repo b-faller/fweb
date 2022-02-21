@@ -4,4 +4,5 @@
 _site
 config.toml
 pages
+posts
 templates
