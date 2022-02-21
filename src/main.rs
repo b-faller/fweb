@@ -35,8 +35,11 @@ struct PageMetadata {
     /// Page title.
     title: String,
     /// Whether the page is the base `index.html`.
-    #[serde(skip)]
+    #[serde(skip_deserializing)]
     is_index: bool,
+    /// If the page should be shown in the navigation.
+    #[serde(default)]
+    hide: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -174,8 +177,10 @@ async fn read_pages_template(pages_dir: impl AsRef<Path>, cfg: &Config) -> io::R
         .map(|p| {
             if p.metadata.is_index {
                 format!("<a href=\"/\">{}</a>\n", p.metadata.title)
-            } else {
+            } else if !p.metadata.hide {
                 format!("<a href=\"/{}/\">{}</a>\n", p.metadata.id, p.metadata.title)
+            } else {
+                "".to_string()
             }
         })
         .collect::<String>();
