@@ -2,16 +2,24 @@ use pulldown_cmark::{html, Options, Parser};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::Path;
+use time::format_description::FormatItem;
+use time::macros::format_description;
+use time::OffsetDateTime;
 
 mod config;
 
 use crate::config::Config;
 
+const DATE_FORMAT: &'static [FormatItem<'static>] =
+    format_description!("[year]-[month]-[day] [hour]:[minute]Z");
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PostMetadata {
     id: String,
     title: String,
-    // date: Option<OffsetDateTime>,
+    excerpt: String,
+    #[serde(with = "time::serde::rfc3339")]
+    date: OffsetDateTime,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,7 +74,7 @@ async fn parse_page(in_page: impl AsRef<Path>) -> io::Result<Page> {
     let input = tokio::fs::read_to_string(&in_page).await?;
     let (frontmatter, markdown) = parse_file(&input);
     let mut metadata: PageMetadata = toml::from_str(frontmatter)?;
-    metadata.is_index = if in_page.as_ref().file_name().expect("file must exist") == "index.md" {
+    metadata.is_index = if in_page.as_ref().file_name().expect("file must exist") == "_index.md" {
         true
     } else {
         false
@@ -176,21 +184,25 @@ async fn read_pages_template(pages_dir: impl AsRef<Path>, cfg: &Config) -> io::R
     let html = html.replace("%%% site_description %%%", &cfg.site.description);
 
     let posts = handle_posts("posts").await?;
-    let mut html_articles = "<ul>".to_string();
+    let mut html_articles = "".to_string();
     for post in &posts {
-        let html_output = html.replace("%%% content %%%", &post.content);
-        html_articles += &format!("<li><a href=\"/posts/{}\">{}</a></li>", post.metadata.id, post.metadata.title);
+        let html = html.replace("%%% content %%%", &post.content);
+        let html_output = html.replace("%%% title %%%", &post.metadata.title);
+        html_articles += &format!(
+            "<div>\n  <h3><a href=\"/posts/{id}\">{title}</a></h3>\n  <p>{excerpt}</p>\n  <p><small>{date}</small></p>\n</div>\n",
+            id=post.metadata.id, title=post.metadata.title, excerpt=post.metadata.excerpt, date=post.metadata.date.format(&DATE_FORMAT).expect("valid date")
+        );
 
         let dir_path = cfg.output_path.join("posts/").join(&post.metadata.id);
         tokio::fs::create_dir_all(&dir_path).await?;
         let index_file_path = dir_path.join("index.html");
         tokio::fs::write(index_file_path, html_output).await?;
     }
-    html_articles += "</ul>";
 
     for page in &pages {
         let html = html.replace("%%% content %%%", &page.content);
-        let html_output = html.replace("%%% articles %%%", &html_articles);
+        let html = html.replace("%%% articles %%%", &html_articles);
+        let html_output = html.replace("%%% title %%%", &page.metadata.title);
 
         if page.metadata.is_index {
             tokio::fs::write("_site/index.html", html_output).await?;
