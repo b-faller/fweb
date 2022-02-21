@@ -189,7 +189,7 @@ async fn read_pages_template(pages_dir: impl AsRef<Path>, cfg: &Config) -> io::R
         let html = html.replace("%%% content %%%", &post.content);
         let html_output = html.replace("%%% title %%%", &post.metadata.title);
         html_articles += &format!(
-            "<div>\n  <h3><a href=\"/posts/{id}\">{title}</a></h3>\n  <p>{excerpt}</p>\n  <p><small>{date}</small></p>\n</div>\n",
+            "<h3><a href=\"/posts/{id}\">{title}</a></h3>\n<p>{excerpt}</p>\n<p><small>{date}</small></p>\n",
             id=post.metadata.id, title=post.metadata.title, excerpt=post.metadata.excerpt, date=post.metadata.date.format(&DATE_FORMAT).expect("valid date")
         );
 
