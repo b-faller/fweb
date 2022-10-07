@@ -68,8 +68,16 @@ impl Website {
         let posts_dir = self.config.content_path.join("posts/");
         let posts = handle_posts(&posts_dir).await?;
 
-        // FIXME: Error handling if directory fails not because it already exists
-        tokio::fs::create_dir(&self.config.output_path).await.ok();
+        // Create output directory ignoring if it already exists
+        tokio::fs::create_dir(&self.config.output_path)
+            .await
+            .or_else(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    Ok(())
+                } else {
+                    Err(Error::CreateDirectory(self.config.output_path.clone(), e))
+                }
+            })?;
 
         // Copy style.
         let css_style = self.config.content_path.join("templates/style.css");
