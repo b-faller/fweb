@@ -11,6 +11,7 @@ use time::OffsetDateTime;
 
 mod config;
 mod error;
+mod template;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -93,7 +94,10 @@ impl Website {
             .await
             .map_err(|e| Error::ReadInput(html_template, e))?;
 
-        // Templating
+        // Apply shortcode templating
+        let html = template::template(&self.config, template_input).await?;
+
+        // Legacy templating
         let nav = pages
             .iter()
             .map(|p| {
@@ -106,7 +110,7 @@ impl Website {
                 }
             })
             .collect::<String>();
-        let html = template_input.replace("%%% nav %%%", &nav);
+        let html = html.replace("%%% nav %%%", &nav);
         let html = html.replace("%%% site_title %%%", &self.config.site_info.title);
         let html = html.replace(
             "%%% site_description %%%",
@@ -352,7 +356,7 @@ async fn main() {
     let it = std::time::Instant::now();
 
     if let Err(e) = try_main().await {
-        error!("{:?}", e);
+        error!("{}", e);
         std::process::exit(1);
     }
 

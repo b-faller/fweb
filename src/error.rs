@@ -33,6 +33,12 @@ pub enum Error {
 
     #[error("Copying file {0} to {1} failed: {2}")]
     Copy(PathBuf, PathBuf, std::io::Error),
+
+    #[error("Could not parse shortcode '{0}'")]
+    ParseShortcode(String),
+
+    #[error("Could include file {0}: {1}")]
+    IncludeShortcode(PathBuf, std::io::Error),
 }
 
 /// Wrapper around the [Error]
