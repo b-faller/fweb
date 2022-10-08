@@ -1,4 +1,6 @@
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use log::{error, info};
 use pulldown_cmark::{html, Options, Parser};
@@ -79,12 +81,11 @@ impl Website {
                 }
             })?;
 
-        // Copy style.
-        let css_style = self.config.content_path.join("templates/style.css");
-        let css_style_copy = self.config.output_path.join("style.css");
-        tokio::fs::copy(&css_style, &css_style_copy)
-            .await
-            .map_err(|e| Error::Copy(css_style, css_style_copy, e))?;
+        // Copy all assets
+        let mirror_assets_handle = mirror_assets(
+            self.config.content_path.join("assets"),
+            self.config.output_path.clone(),
+        );
 
         // Read template
         let html_template = self.config.content_path.join("templates/index.html");
@@ -158,8 +159,38 @@ impl Website {
             }
         }
 
+        mirror_assets_handle.await?;
+
         Ok(())
     }
+}
+
+/// Mirror the assets fully.
+fn mirror_assets(from: PathBuf, to: PathBuf) -> Pin<Box<dyn Future<Output = Result<()>>>> {
+    Box::pin(async move {
+        let mut entries = tokio::fs::read_dir(&from)
+            .await
+            .map_err(|e| Error::ReadDirectory(from.clone(), e))?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| Error::ReadDirectory(from.clone(), e))?
+        {
+            let new_from = entry.path();
+            let new_to = to.join(entry.file_name());
+            if new_from.is_dir() {
+                tokio::fs::create_dir_all(new_to.clone())
+                    .await
+                    .map_err(|e| Error::CreateDirectory(new_to.clone(), e))?;
+                mirror_assets(new_from, new_to).await?;
+            } else if new_from.is_file() {
+                tokio::fs::copy(&new_from, &new_to)
+                    .await
+                    .map_err(|e| Error::Copy(new_from, new_to, e))?;
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Extract frontmatter and markdown from a input file.
