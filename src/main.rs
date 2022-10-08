@@ -2,7 +2,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
-use log::{error, info};
+use log::{debug, error, info};
 use pulldown_cmark::{html, Options, Parser};
 use serde::{Deserialize, Serialize};
 use time::format_description::FormatItem;
@@ -71,17 +71,6 @@ impl Website {
         let posts_dir = self.config.content_path.join("posts/");
         let posts = handle_posts(&posts_dir).await?;
 
-        // Create output directory ignoring if it already exists
-        tokio::fs::create_dir(&self.config.output_path)
-            .await
-            .or_else(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    Ok(())
-                } else {
-                    Err(Error::CreateDirectory(self.config.output_path.clone(), e))
-                }
-            })?;
-
         // Copy all assets
         let mirror_assets_handle = mirror_assets(
             self.config.content_path.join("assets"),
@@ -94,10 +83,8 @@ impl Website {
             .await
             .map_err(|e| Error::ReadInput(html_template, e))?;
 
-        // Apply shortcode templating
-        let html = template::template(&self.config, template_input).await?;
-
-        // Legacy templating
+        // Fill templating context
+        let mut ctx = template::Context::new();
         let nav = pages
             .iter()
             .map(|p| {
@@ -110,22 +97,27 @@ impl Website {
                 }
             })
             .collect::<String>();
-        let html = html.replace("%%% nav %%%", &nav);
-        let html = html.replace("%%% site_title %%%", &self.config.site_info.title);
-        let html = html.replace(
-            "%%% site_description %%%",
-            &self.config.site_info.description,
+        ctx.insert("nav", nav);
+        ctx.insert("site_title", self.config.site_info.title.to_string());
+        ctx.insert(
+            "site_description",
+            self.config.site_info.description.to_string(),
         );
 
         // Create articles
         let mut html_articles = String::new();
         for post in &posts {
-            let html = html.replace("%%% content %%%", &post.content);
-            let html_output = html.replace("%%% title %%%", &post.metadata.title);
+            debug!("Building post '{}'", &post.metadata.title);
+            ctx.insert("content", post.content.to_string());
+            ctx.insert("title", post.metadata.title.to_string());
+
             html_articles += &format!(
                 "<h3><a href=\"/posts/{id}\">{title}</a></h3>\n<p>{excerpt}</p>\n<p><small>{date}</small></p>\n",
                 id=post.metadata.id, title=post.metadata.title, excerpt=post.metadata.excerpt, date=post.metadata.date.format(&DATE_FORMAT).expect("valid date")
             );
+
+            // Apply shortcode templating
+            let html = template::template(&self.config, &ctx, template_input.clone()).await?;
 
             let dir_path = self
                 .config
@@ -136,19 +128,23 @@ impl Website {
                 .await
                 .map_err(|e| Error::CreateDirectory(dir_path.clone(), e))?;
             let index_file_path = dir_path.join("index.html");
-            tokio::fs::write(index_file_path, html_output)
+            tokio::fs::write(index_file_path, html)
                 .await
                 .map_err(|e| Error::WriteFile(dir_path, e))?;
         }
+        ctx.insert("articles", html_articles);
 
         for page in &pages {
-            let html = html.replace("%%% content %%%", &page.content);
-            let html = html.replace("%%% articles %%%", &html_articles);
-            let html_output = html.replace("%%% title %%%", &page.metadata.title);
+            debug!("Building page '{}'", &page.metadata.title);
+            ctx.insert("title", page.metadata.title.to_string());
+            ctx.insert("content", page.content.to_string());
+
+            // Apply shortcode templating
+            let html = template::template(&self.config, &ctx, template_input.clone()).await?;
 
             if page.metadata.is_index {
                 let path = self.config.output_path.join("index.html");
-                tokio::fs::write(&path, html_output)
+                tokio::fs::write(&path, html)
                     .await
                     .map_err(|e| Error::WriteFile(path, e))?;
             } else {
@@ -157,7 +153,7 @@ impl Website {
                     .await
                     .map_err(|e| Error::CreateDirectory(dir_path.clone(), e))?;
                 let index_file_path = dir_path.join("index.html");
-                tokio::fs::write(&index_file_path, html_output)
+                tokio::fs::write(&index_file_path, html)
                     .await
                     .map_err(|e| Error::WriteFile(index_file_path, e))?;
             }
@@ -350,9 +346,7 @@ async fn try_main() -> Result<()> {
 
 #[tokio::main]
 async fn main() {
-    env_logger::Builder::new()
-        .filter(None, log::LevelFilter::Debug)
-        .init();
+    env_logger::init();
     let it = std::time::Instant::now();
 
     if let Err(e) = try_main().await {

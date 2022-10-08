@@ -37,8 +37,11 @@ pub enum Error {
     #[error("Could not parse shortcode '{0}'")]
     ParseShortcode(String),
 
-    #[error("Could include file {0}: {1}")]
+    #[error("Could not include file {0}: {1}")]
     IncludeShortcode(PathBuf, std::io::Error),
+
+    #[error("Tag '{0}' does not exist")]
+    TagNotFound(String),
 }
 
 /// Wrapper around the [Error]
