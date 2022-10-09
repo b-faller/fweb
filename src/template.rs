@@ -1,4 +1,5 @@
-//! This module is responsible for replacing shortcodes from input files with the appropriate data.
+//! This module is responsible for replacing shortcodes from input files with
+//! the appropriate data.
 
 use std::{collections::HashMap, path::PathBuf, str::FromStr};
 
@@ -11,7 +12,8 @@ use crate::{
 
 /// Start delimiter of a shortcode.
 ///
-/// This is used to detect a beginning shortcode as all shortcodes start with this delimiter.
+/// This is used to detect a beginning shortcode as all shortcodes start with
+/// this delimiter.
 const SHORTCODE_START: char = '{';
 
 /// Start delimiter of a command.
@@ -96,7 +98,8 @@ impl FromStr for Shortcode {
 /// Find a shortcode within the given input.
 ///
 /// This returns the start and end indices including the delimiters.
-/// Essentially this is the range which gives the shortcut itself back from the input:
+/// Essentially this is the range which gives the shortcut itself back from the
+/// input:
 ///
 /// ```rust
 /// let (start, end) = find_shortcode(input);

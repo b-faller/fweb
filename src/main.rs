@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{hash_map, HashMap};
 use std::os::unix::prelude::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -24,8 +24,8 @@ use crate::error::{Error, Result};
 const DATE_FORMAT: &[FormatItem<'static>] =
     format_description!("[year]-[month]-[day] [hour]:[minute]Z");
 
-/// Export configuration to export a date and time compatible with the datetime attribute used in the HTML `<time>`
-/// element.
+/// Export configuration to export a date and time compatible with the datetime
+/// attribute used in the HTML `<time>` element.
 const DATE_ISO_CONFIG: EncodedConfig = iso8601::Config::DEFAULT
     .set_time_precision(TimePrecision::Second {
         decimal_digits: None,
@@ -139,46 +139,64 @@ impl Website {
 
         // Store templates in a cache
         let templates_dir = self.config.content_path.join("templates");
-        for post in &posts {
-            load_template(
-                &mut self.template_cache,
-                templates_dir.clone(),
-                post.metadata.template.clone(),
-            )
-            .await?;
-        }
-        for page in &pages {
-            load_template(
-                &mut self.template_cache,
-                templates_dir.clone(),
-                page.metadata.template.clone(),
-            )
-            .await?;
+        let templates_iter = posts
+            .iter()
+            .map(|post| post.metadata.template.clone())
+            .chain(pages.iter().map(|page| page.metadata.template.clone()));
+        for path in templates_iter {
+            if let hash_map::Entry::Vacant(e) = self.template_cache.entry(path.clone()) {
+                let full_path = templates_dir.join(&path);
+                let template = tokio::fs::read_to_string(&full_path)
+                    .await
+                    .map_err(|e| Error::ReadInput(path, e))?;
+                e.insert(template);
+            }
         }
 
         // Fill templating context
         let mut ctx = template::Context::new();
-        let nav = pages
-            .iter()
-            .map(|p| {
-                if p.metadata.is_index {
-                    format!("<a href=\"/\">{}</a>\n", p.metadata.title)
-                } else if !p.metadata.hide {
-                    format!("<a href=\"/{}/\">{}</a>\n", p.metadata.id, p.metadata.title)
-                } else {
-                    "".to_string()
-                }
-            })
-            .collect::<String>();
-        ctx.insert("nav", nav);
+        ctx.insert(
+            "nav",
+            pages
+                .iter()
+                .map(|p| {
+                    if p.metadata.is_index {
+                        format!("<a href=\"/\">{}</a>\n", p.metadata.title)
+                    } else if !p.metadata.hide {
+                        format!("<a href=\"/{}/\">{}</a>\n", p.metadata.id, p.metadata.title)
+                    } else {
+                        "".to_string()
+                    }
+                })
+                .collect::<String>(),
+        );
+        ctx.insert(
+            "articles",
+            posts
+                .iter()
+                .map(|post| {
+                    // Append current metadata as HTML to post TOC
+                    format!(
+                        "<hgroup>\n<h3><a href=\"/posts/{id}\">{title}</a></h3>\n<p><small><time \
+                         datetime=\"{iso_date}\">{date}</time></small></p>\n</hgroup>\\
+                         n<p>{excerpt}</p>\n",
+                        id = post.metadata.id,
+                        title = post.metadata.title,
+                        excerpt = post.metadata.excerpt,
+                        iso_date = format_date_iso8601(&post.metadata.date),
+                        date = format_date_utc(&post.metadata.date),
+                    )
+                })
+                .collect(),
+        );
         ctx.insert("site_title", self.config.site_info.title.to_string());
         ctx.insert(
             "site_description",
             self.config.site_info.description.to_string(),
         );
 
-        export_posts_to_html(&self.config, &mut ctx, &self.template_cache, &posts).await?;
-        export_pages_to_html(&self.config, &mut ctx, &self.template_cache, &pages).await?;
+        export_posts_to_html(&self.config, &mut ctx, &self.template_cache, posts).await?;
+        export_pages_to_html(&self.config, &mut ctx, &self.template_cache, pages).await?;
 
         mirror_assets_handle.await.map_err(Error::Join)??;
 
@@ -186,19 +204,62 @@ impl Website {
     }
 }
 
+fn format_date_iso8601(date: &OffsetDateTime) -> String {
+    date.format(&Iso8601::<DATE_ISO_CONFIG>)
+        .expect("date already validated")
+}
+
+fn format_date_utc(date: &OffsetDateTime) -> String {
+    date.to_offset(time::macros::offset!(UTC))
+        .format(&DATE_FORMAT)
+        .expect("date already validated")
+}
+
+async fn export_html_file(
+    path: &Path,
+    template: String,
+    is_index: bool,
+    cfg: &Config,
+    ctx: &Context,
+) -> Result<()> {
+    // Apply templating
+    let html = template::template(cfg, ctx, template).await?;
+
+    if is_index {
+        let path = cfg.output_path.join("index.html");
+        tokio::fs::write(&path, html)
+            .await
+            .map_err(|e| Error::WriteFile(path, e))?;
+    } else {
+        tokio::fs::create_dir_all(&path)
+            .await
+            .map_err(|e| Error::CreateDirectory(path.to_path_buf(), e))?;
+        let index_file_path = path.join("index.html");
+        tokio::fs::write(&index_file_path, html)
+            .await
+            .map_err(|e| Error::WriteFile(index_file_path, e))?;
+    }
+
+    Ok(())
+}
+
 async fn export_pages_to_html(
     cfg: &Config,
-    context: &mut Context,
+    ctx: &mut Context,
     template_cache: &HashMap<PathBuf, String>,
-    pages: &[Page],
+    pages: Vec<Page>,
 ) -> Result<()> {
     let mut handles = Vec::new();
 
     for page in pages {
-        let page = page.clone();
+        debug!("Building page '{:?}'", &page.metadata);
+
         let cfg = cfg.clone();
-        let mut ctx = context.clone();
-        let template_cache = template_cache.clone();
+        let mut ctx = ctx.clone();
+        let template = template_cache
+            .get(&page.metadata.template)
+            .expect("templates are loaded")
+            .clone();
 
         handles.push(tokio::spawn(async move {
             debug!("Building page '{:?}'", &page.metadata);
@@ -207,29 +268,8 @@ async fn export_pages_to_html(
             ctx.insert("title", page.metadata.title.to_string());
             ctx.insert("content", page.content.to_string());
 
-            // Apply templating
-            let template = template_cache
-                .get(&page.metadata.template)
-                .expect("templates are loaded");
-            let html = template::template(&cfg, &ctx, template.clone()).await?;
-
-            if page.metadata.is_index {
-                let path = cfg.output_path.join("index.html");
-                tokio::fs::write(&path, html)
-                    .await
-                    .map_err(|e| Error::WriteFile(path, e))?;
-            } else {
-                let dir_path = cfg.output_path.join(&page.metadata.id);
-                tokio::fs::create_dir_all(&dir_path)
-                    .await
-                    .map_err(|e| Error::CreateDirectory(dir_path.clone(), e))?;
-                let index_file_path = dir_path.join("index.html");
-                tokio::fs::write(&index_file_path, html)
-                    .await
-                    .map_err(|e| Error::WriteFile(index_file_path, e))?;
-            }
-
-            Result::Ok(())
+            let path = cfg.output_path.join(&page.metadata.id);
+            export_html_file(&path, template, page.metadata.is_index, &cfg, &ctx).await
         }));
     }
 
@@ -245,78 +285,39 @@ async fn export_posts_to_html(
     cfg: &Config,
     ctx: &mut Context,
     template_cache: &HashMap<PathBuf, String>,
-    posts: &[Post],
+    posts: Vec<Post>,
 ) -> Result<()> {
-    // Export posts and build post table of contents
-    let mut html_post_toc = String::new();
+    let mut handles = Vec::new();
+
     for post in posts {
         debug!("Building post '{:?}'", &post.metadata);
 
-        // Insert metadata as current context for templating
-        ctx.insert("content", post.content.to_string());
-        ctx.insert("title", post.metadata.title.to_string());
-        ctx.insert("excerpt", post.metadata.excerpt.to_string());
-        ctx.insert(
-            "date_iso8601",
-            post.metadata
-                .date
-                .format(&Iso8601::<DATE_ISO_CONFIG>)
-                .expect("date already validated"),
-        );
-        ctx.insert(
-            "date",
-            post.metadata
-                .date
-                .to_offset(time::macros::offset!(UTC))
-                .format(&DATE_FORMAT)
-                .expect("date already validated"),
-        );
-
-        // Append current metadata as HTML to post TOC
-        html_post_toc += &format!(
-                    "<hgroup>\n<h3><a href=\"/posts/{id}\">{title}</a></h3>\n<p><small><time datetime=\"{iso_date}\">{date}</time></small></p>\n</hgroup>\n<p>{excerpt}</p>\n",
-                    id=post.metadata.id, title=post.metadata.title, excerpt=post.metadata.excerpt,
-                    iso_date=ctx.get("date_iso8601").expect("date was stored"),
-                    date=ctx.get("date").expect("date was stored")
-                );
-
-        // Apply templating
+        let cfg = cfg.clone();
+        let mut ctx = ctx.clone();
         let template = template_cache
             .get(&post.metadata.template)
-            .expect("templates are loaded");
-        let html = template::template(cfg, ctx, template.clone()).await?;
+            .expect("templates are loaded")
+            .clone();
 
-        let dir_path = cfg.output_path.join("posts/").join(&post.metadata.id);
-        tokio::fs::create_dir_all(&dir_path)
-            .await
-            .map_err(|e| Error::CreateDirectory(dir_path.clone(), e))?;
-        let index_file_path = dir_path.join("index.html");
-        tokio::fs::write(index_file_path, html)
-            .await
-            .map_err(|e| Error::WriteFile(dir_path, e))?;
+        handles.push(tokio::spawn(async move {
+            // Insert metadata as current context for templating
+            ctx.insert("content", post.content.to_string());
+            ctx.insert("title", post.metadata.title.to_string());
+            ctx.insert("excerpt", post.metadata.excerpt.to_string());
+            ctx.insert("date_iso8601", format_date_iso8601(&post.metadata.date));
+            ctx.insert("date", format_date_iso8601(&post.metadata.date));
+
+            let path = cfg.output_path.join("posts").join(&post.metadata.id);
+            export_html_file(&path, template, false, &cfg, &ctx).await
+        }));
     }
-    ctx.insert("articles", html_post_toc);
+
+    // Wait for all processing to complete
+    for task in handles {
+        task.await.map_err(Error::Join)??;
+    }
 
     Ok(())
-}
-
-/// Load a template from disk.
-///
-/// If the template was already previously loaded, it is fetched from the cache.
-async fn load_template(
-    template_cache: &mut HashMap<PathBuf, String>,
-    templates_dir: PathBuf,
-    template_path: PathBuf,
-) -> Result<String> {
-    if let Some(template) = template_cache.get(&template_path) {
-        return Ok(template.clone());
-    }
-    let full_path = templates_dir.join(template_path.clone());
-    let template = tokio::fs::read_to_string(&full_path)
-        .await
-        .map_err(|e| Error::ReadInput(template_path.clone(), e))?;
-    template_cache.insert(template_path, template.clone());
-    Ok(template)
 }
 
 /// Mirror the assets fully.
