@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -5,6 +6,8 @@ use std::pin::Pin;
 use log::{debug, error, info};
 use pulldown_cmark::{html, Options, Parser};
 use serde::{Deserialize, Serialize};
+use time::format_description::well_known::iso8601::{self, EncodedConfig, TimePrecision};
+use time::format_description::well_known::Iso8601;
 use time::format_description::FormatItem;
 use time::macros::format_description;
 use time::OffsetDateTime;
@@ -20,13 +23,31 @@ use crate::error::{Error, Result};
 const DATE_FORMAT: &[FormatItem<'static>] =
     format_description!("[year]-[month]-[day] [hour]:[minute]Z");
 
+/// Export configuration to export a date and time compatible with the datetime attribute used in the HTML `<time>`
+/// element.
+const DATE_ISO_CONFIG: EncodedConfig = iso8601::Config::DEFAULT
+    .set_time_precision(TimePrecision::Second {
+        decimal_digits: None,
+    })
+    .encode();
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PostMetadata {
+    /// ID used for URLs.
     id: String,
+    /// Template file to use.
+    #[serde(default = "default_post_template")]
+    template: PathBuf,
+    /// Post title.
     title: String,
+    /// Excerpt of the post content.
     excerpt: String,
     #[serde(with = "time::serde::rfc3339")]
     date: OffsetDateTime,
+}
+
+fn default_post_template() -> PathBuf {
+    "post.html".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +60,9 @@ struct Post {
 struct PageMetadata {
     /// ID used for URLs.
     id: String,
+    /// Template file to use.
+    #[serde(default = "default_page_template")]
+    template: PathBuf,
     /// Page title.
     title: String,
     /// Whether the page is the base `index.html`.
@@ -47,6 +71,10 @@ struct PageMetadata {
     /// If the page should be shown in the navigation.
     #[serde(default)]
     hide: bool,
+}
+
+fn default_page_template() -> PathBuf {
+    "page.html".into()
 }
 
 #[derive(Debug, Clone)]
@@ -77,11 +105,9 @@ impl Website {
             self.config.output_path.clone(),
         );
 
-        // Read template
-        let html_template = self.config.content_path.join("templates/index.html");
-        let template_input = tokio::fs::read_to_string(&html_template)
-            .await
-            .map_err(|e| Error::ReadInput(html_template, e))?;
+        // Store templates in a cache
+        let templates_dir = self.config.content_path.join("templates");
+        let mut template_cache = HashMap::new();
 
         // Fill templating context
         let mut ctx = template::Context::new();
@@ -104,20 +130,43 @@ impl Website {
             self.config.site_info.description.to_string(),
         );
 
-        // Create articles
-        let mut html_articles = String::new();
+        // Export posts and build post table of contents
+        let mut html_post_toc = String::new();
         for post in &posts {
-            debug!("Building post '{}'", &post.metadata.title);
+            debug!("Building post '{:?}'", &post.metadata);
+
+            // Insert metadata as current context for templating
             ctx.insert("content", post.content.to_string());
             ctx.insert("title", post.metadata.title.to_string());
-
-            html_articles += &format!(
-                "<h3><a href=\"/posts/{id}\">{title}</a></h3>\n<p>{excerpt}</p>\n<p><small>{date}</small></p>\n",
-                id=post.metadata.id, title=post.metadata.title, excerpt=post.metadata.excerpt, date=post.metadata.date.format(&DATE_FORMAT).expect("valid date")
+            ctx.insert("excerpt", post.metadata.excerpt.to_string());
+            ctx.insert(
+                "date_iso8601",
+                post.metadata
+                    .date
+                    .format(&Iso8601::<DATE_ISO_CONFIG>)
+                    .expect("date already validated"),
+            );
+            ctx.insert(
+                "date",
+                post.metadata
+                    .date
+                    .to_offset(time::macros::offset!(UTC))
+                    .format(&DATE_FORMAT)
+                    .expect("date already validated"),
             );
 
-            // Apply shortcode templating
-            let html = template::template(&self.config, &ctx, template_input.clone()).await?;
+            // Append current metadata as HTML to post TOC
+            html_post_toc += &format!(
+                "<hgroup>\n<h3><a href=\"/posts/{id}\">{title}</a></h3>\n<p><small><time datetime=\"{iso_date}\">{date}</time></small></p>\n</hgroup>\n<p>{excerpt}</p>\n",
+                id=post.metadata.id, title=post.metadata.title, excerpt=post.metadata.excerpt,
+                iso_date=ctx.get("date_iso8601").expect("date was stored"),
+                date=ctx.get("date").expect("date was stored")
+            );
+
+            // Apply templating
+            let template_path = templates_dir.join(&post.metadata.template);
+            let template = load_template(&mut template_cache, template_path).await?;
+            let html = template::template(&self.config, &ctx, template).await?;
 
             let dir_path = self
                 .config
@@ -132,15 +181,19 @@ impl Website {
                 .await
                 .map_err(|e| Error::WriteFile(dir_path, e))?;
         }
-        ctx.insert("articles", html_articles);
+        ctx.insert("articles", html_post_toc);
 
         for page in &pages {
-            debug!("Building page '{}'", &page.metadata.title);
+            debug!("Building page '{:?}'", &page.metadata);
+
+            // Insert page metadata into context for templating
             ctx.insert("title", page.metadata.title.to_string());
             ctx.insert("content", page.content.to_string());
 
-            // Apply shortcode templating
-            let html = template::template(&self.config, &ctx, template_input.clone()).await?;
+            // Apply templating
+            let template_path = templates_dir.join(&page.metadata.template);
+            let template = load_template(&mut template_cache, template_path).await?;
+            let html = template::template(&self.config, &ctx, template).await?;
 
             if page.metadata.is_index {
                 let path = self.config.output_path.join("index.html");
@@ -163,6 +216,23 @@ impl Website {
 
         Ok(())
     }
+}
+
+/// Load a template from disk.
+///
+/// If the template was already previously loaded, it is fetched from the cache.
+async fn load_template(
+    template_cache: &mut HashMap<PathBuf, String>,
+    path: PathBuf,
+) -> Result<String> {
+    if let Some(template) = template_cache.get(&path) {
+        return Ok(template.clone());
+    }
+    let template = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| Error::ReadInput(path.clone(), e))?;
+    template_cache.insert(path, template.clone());
+    Ok(template)
 }
 
 /// Mirror the assets fully.
