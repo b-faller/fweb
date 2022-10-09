@@ -4,9 +4,6 @@ use thiserror::Error as ErrorTrait;
 
 #[derive(Debug, ErrorTrait)]
 pub enum Error {
-    #[error("Source directory {0} is invalid: {1}")]
-    SourceDir(PathBuf, std::io::Error),
-
     #[error("Reading config file {0} failed: {1}")]
     ConfigRead(PathBuf, std::io::Error),
 
