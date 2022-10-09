@@ -25,8 +25,8 @@ pub enum Error {
     #[error("Create directory {0} failed: {1}")]
     CreateDirectory(PathBuf, std::io::Error),
 
-    #[error("Failed to join page futures: {0}")]
-    PageJoin(tokio::task::JoinError),
+    #[error("Failed to join futures: {0}")]
+    Join(tokio::task::JoinError),
 
     #[error("Copying file {0} to {1} failed: {2}")]
     Copy(PathBuf, PathBuf, std::io::Error),

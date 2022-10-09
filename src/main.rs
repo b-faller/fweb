@@ -1,9 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::future::Future;
 use std::os::unix::prelude::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 
 use log::{debug, error, info};
 use pulldown_cmark::{html, Options, Parser};
@@ -124,6 +122,11 @@ impl Website {
 
     /// Build the website to HTML content.
     async fn build(mut self) -> Result<()> {
+        // Copy all assets
+        let from = self.config.content_path.join("assets");
+        let to = self.config.output_path.clone();
+        let mirror_assets_handle = tokio::spawn(async move { mirror_assets(from, to).await });
+
         // Read pages.
         let pages_dir = self.config.content_path.join("pages");
         let mut pages = handle_pages(pages_dir).await?;
@@ -144,12 +147,6 @@ impl Website {
         let mut posts = handle_posts(&posts_dir).await?;
         // Sort posts based on their date descending.
         posts.sort_unstable_by(|p1, p2| p2.metadata.date.cmp(&p1.metadata.date));
-
-        // Copy all assets
-        let mirror_assets_handle = mirror_assets(
-            self.config.content_path.join("assets"),
-            self.config.output_path.clone(),
-        );
 
         // Store templates in a cache
         let templates_dir = self.config.content_path.join("templates");
@@ -194,7 +191,7 @@ impl Website {
         export_posts_to_html(&self.config, &mut ctx, &self.template_cache, &posts).await?;
         export_pages_to_html(&self.config, &mut ctx, &self.template_cache, &pages).await?;
 
-        mirror_assets_handle.await?;
+        mirror_assets_handle.await.map_err(Error::Join)??;
 
         Ok(())
     }
@@ -249,7 +246,7 @@ async fn export_pages_to_html(
 
     // Wait for all processing to complete
     for task in handles {
-        task.await.map_err(Error::PageJoin)??;
+        task.await.map_err(Error::Join)??;
     }
 
     Ok(())
@@ -334,8 +331,17 @@ async fn load_template(
 }
 
 /// Mirror the assets fully.
-fn mirror_assets(from: PathBuf, to: PathBuf) -> Pin<Box<dyn Future<Output = Result<()>>>> {
-    Box::pin(async move {
+async fn mirror_assets(from: PathBuf, to: PathBuf) -> Result<()> {
+    // Ensure that the output base directory exists.
+    tokio::fs::create_dir_all(&to)
+        .await
+        .map_err(|e| Error::CreateDirectory(to.clone(), e))?;
+
+    // Stack storing the directories which remain to be processed
+    let mut stack = vec![(from, to)];
+
+    while let Some((from, to)) = stack.pop() {
+        // Iterate over the current directory entries
         let mut entries = tokio::fs::read_dir(&from)
             .await
             .map_err(|e| Error::ReadDirectory(from.clone(), e))?;
@@ -347,18 +353,22 @@ fn mirror_assets(from: PathBuf, to: PathBuf) -> Pin<Box<dyn Future<Output = Resu
             let new_from = entry.path();
             let new_to = to.join(entry.file_name());
             if new_from.is_dir() {
-                tokio::fs::create_dir_all(new_to.clone())
+                // Replicate the found directory
+                tokio::fs::create_dir_all(&new_to)
                     .await
                     .map_err(|e| Error::CreateDirectory(new_to.clone(), e))?;
-                mirror_assets(new_from, new_to).await?;
+                // Add the directory to the stack to iterate later
+                stack.push((new_from, new_to));
             } else if new_from.is_file() {
+                // Copy the found file
                 tokio::fs::copy(&new_from, &new_to)
                     .await
                     .map_err(|e| Error::Copy(new_from, new_to, e))?;
             }
         }
-        Ok(())
-    })
+    }
+
+    Ok(())
 }
 
 /// Extract frontmatter and markdown from a input file.
@@ -427,7 +437,7 @@ async fn handle_pages(pages_dir: impl AsRef<Path>) -> Result<Vec<Page>> {
     }
 
     for handle in handles {
-        let page = handle.await.map_err(Error::PageJoin)??;
+        let page = handle.await.map_err(Error::Join)??;
         pages.push(page);
     }
 
@@ -473,7 +483,7 @@ async fn handle_posts(posts_dir: impl AsRef<Path>) -> Result<Vec<Post>> {
     }
 
     for handle in handles {
-        let page = handle.await.map_err(Error::PageJoin)??;
+        let page = handle.await.map_err(Error::Join)??;
         posts.push(page);
     }
 
