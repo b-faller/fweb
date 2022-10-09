@@ -1,5 +1,7 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::future::Future;
+use std::os::unix::prelude::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
@@ -35,11 +37,18 @@ const DATE_ISO_CONFIG: EncodedConfig = iso8601::Config::DEFAULT
 struct PostMetadata {
     /// ID used for URLs.
     id: String,
+
+    /// The path to the markdown input file.
+    #[serde(skip_deserializing)]
+    filepath: PathBuf,
+
     /// Template file to use.
     #[serde(default = "default_post_template")]
     template: PathBuf,
+
     /// Post title.
     title: String,
+
     /// Excerpt of the post content.
     excerpt: String,
     #[serde(with = "time::serde::rfc3339")]
@@ -60,14 +69,22 @@ struct Post {
 struct PageMetadata {
     /// ID used for URLs.
     id: String,
+
+    /// The path to the markdown input file.
+    #[serde(skip_deserializing)]
+    filepath: PathBuf,
+
     /// Template file to use.
     #[serde(default = "default_page_template")]
     template: PathBuf,
+
     /// Page title.
     title: String,
+
     /// Whether the page is the base `index.html`.
     #[serde(skip_deserializing)]
     is_index: bool,
+
     /// If the page should be shown in the navigation.
     #[serde(default)]
     hide: bool,
@@ -93,11 +110,24 @@ impl Website {
     pub async fn build(&self) -> Result<()> {
         // Read pages.
         let pages_dir = self.config.content_path.join("pages");
-        let pages = handle_pages(pages_dir).await?;
+        let mut pages = handle_pages(pages_dir).await?;
+        // Sort posts based on their date descending.
+        pages.sort_unstable_by(|p1, p2| {
+            let f1 = p1.metadata.filepath.file_name().expect("page has filename");
+            let f2 = p2.metadata.filepath.file_name().expect("page has filename");
+            // Sort '_' first
+            match (f1.as_bytes(), f2.as_bytes()) {
+                ([b'_', ..], _) => Ordering::Less,
+                (_, [b'_', ..]) => Ordering::Greater,
+                (f1, f2) => f1.cmp(f2),
+            }
+        });
 
         // Read posts.
         let posts_dir = self.config.content_path.join("posts/");
-        let posts = handle_posts(&posts_dir).await?;
+        let mut posts = handle_posts(&posts_dir).await?;
+        // Sort posts based on their date descending.
+        posts.sort_unstable_by(|p1, p2| p2.metadata.date.cmp(&p1.metadata.date));
 
         // Copy all assets
         let mirror_assets_handle = mirror_assets(
@@ -294,10 +324,12 @@ async fn parse_page(in_page: impl AsRef<Path>) -> Result<Page> {
     let input = tokio::fs::read_to_string(&in_page)
         .await
         .map_err(|e| Error::ReadInput(in_page.into(), e))?;
+
     let (frontmatter, markdown) = parse_file(&input, &in_page)?;
     let mut metadata: PageMetadata =
         toml::from_str(frontmatter).map_err(|e| Error::ParseMetadata(in_page.into(), e))?;
     metadata.is_index = in_page.file_name().expect("file must exist") == "_index.md";
+    metadata.filepath = in_page.to_path_buf();
 
     let html = convert_markdown(markdown).await;
     let page = Page {
@@ -335,13 +367,15 @@ async fn handle_pages(pages_dir: impl AsRef<Path>) -> Result<Vec<Page>> {
 }
 
 async fn parse_post(in_post: impl AsRef<Path>) -> Result<Post> {
-    let in_page = in_post.as_ref();
-    let input = tokio::fs::read_to_string(&in_page)
+    let in_post = in_post.as_ref();
+    let input = tokio::fs::read_to_string(&in_post)
         .await
-        .map_err(|e| Error::ReadInput(in_page.into(), e))?;
-    let (frontmatter, markdown) = parse_file(&input, &in_page)?;
-    let metadata: PostMetadata =
-        toml::from_str(frontmatter).map_err(|e| Error::ParseMetadata(in_page.into(), e))?;
+        .map_err(|e| Error::ReadInput(in_post.into(), e))?;
+
+    let (frontmatter, markdown) = parse_file(&input, &in_post)?;
+    let mut metadata: PostMetadata =
+        toml::from_str(frontmatter).map_err(|e| Error::ParseMetadata(in_post.into(), e))?;
+    metadata.filepath = in_post.to_path_buf();
 
     let html = convert_markdown(markdown).await;
     let post = Post {
@@ -374,9 +408,6 @@ async fn handle_posts(posts_dir: impl AsRef<Path>) -> Result<Vec<Post>> {
         let page = handle.await.map_err(Error::PageJoin)??;
         posts.push(page);
     }
-
-    // Sort posts based on their date descending.
-    posts.sort_by(|p1, p2| p2.metadata.date.cmp(&p1.metadata.date));
 
     Ok(posts)
 }
