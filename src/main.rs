@@ -1,6 +1,5 @@
 use std::{
     cmp::Ordering,
-    collections::{hash_map, HashMap},
     os::unix::prelude::OsStrExt,
     path::{Path, PathBuf},
 };
@@ -113,25 +112,16 @@ struct Page {
 struct Website {
     /// Configuration for this website.
     config: Config,
-
-    /// Cache for all templates.
-    ///
-    /// This is to only load a template once from disk and store them in Memory
-    template_cache: HashMap<PathBuf, String>,
 }
 
 impl Website {
     /// Create a new website.
     fn new(config: Config) -> Self {
-        let template_cache = HashMap::new();
-        Website {
-            config,
-            template_cache,
-        }
+        Website { config }
     }
 
     /// Build the website to HTML content.
-    async fn build(mut self) -> Result<()> {
+    async fn build(self) -> Result<()> {
         // Copy all assets
         let from = self.config.content_path.join("assets");
         let to = self.config.output_path.clone();
@@ -146,22 +136,6 @@ impl Website {
         )
         .map_err(Error::Join)?;
         let (posts, pages) = (posts?, pages?);
-
-        // Store templates in a cache
-        let templates_dir = self.config.content_path.join("templates");
-        let templates_iter = posts
-            .iter()
-            .map(|post| post.metadata.template.clone())
-            .chain(pages.iter().map(|page| page.metadata.template.clone()));
-        for path in templates_iter {
-            if let hash_map::Entry::Vacant(e) = self.template_cache.entry(path.clone()) {
-                let full_path = templates_dir.join(&path);
-                let template = tokio::fs::read_to_string(&full_path)
-                    .await
-                    .map_err(|e| Error::ReadInput(path, e))?;
-                e.insert(template);
-            }
-        }
 
         // Fill templating context
         let mut ctx = template::Context::new();
@@ -205,8 +179,8 @@ impl Website {
             self.config.site_info.description.to_string(),
         );
 
-        export_posts_to_html(&self.config, &mut ctx, &self.template_cache, posts).await?;
-        export_pages_to_html(&self.config, &mut ctx, &self.template_cache, pages).await?;
+        export_posts_to_html(&self.config, &mut ctx, posts).await?;
+        export_pages_to_html(&self.config, &mut ctx, pages).await?;
 
         mirror_assets_handle.await.map_err(Error::Join)??;
 
@@ -227,12 +201,15 @@ fn format_date_utc(date: &OffsetDateTime) -> String {
 
 async fn export_html_file(
     path: &Path,
-    template: String,
+    template: &Path,
     is_index: bool,
     cfg: &Config,
     ctx: &Context,
 ) -> Result<()> {
     // Apply templating
+    let template = tokio::fs::read_to_string(template)
+        .await
+        .map_err(|e| Error::ReadInput(template.to_path_buf(), e))?;
     let html = template::template(cfg, ctx, template).await?;
 
     if is_index {
@@ -253,12 +230,7 @@ async fn export_html_file(
     Ok(())
 }
 
-async fn export_pages_to_html(
-    cfg: &Config,
-    ctx: &mut Context,
-    template_cache: &HashMap<PathBuf, String>,
-    pages: Vec<Page>,
-) -> Result<()> {
+async fn export_pages_to_html(cfg: &Config, ctx: &mut Context, pages: Vec<Page>) -> Result<()> {
     let mut handles = Vec::new();
 
     for page in pages {
@@ -266,10 +238,6 @@ async fn export_pages_to_html(
 
         let cfg = cfg.clone();
         let mut ctx = ctx.clone();
-        let template = template_cache
-            .get(&page.metadata.template)
-            .expect("templates are loaded")
-            .clone();
 
         handles.push(tokio::spawn(async move {
             debug!("Building page '{:?}'", &page.metadata);
@@ -279,7 +247,11 @@ async fn export_pages_to_html(
             ctx.insert("content", page.content.to_string());
 
             let path = cfg.output_path.join(&page.metadata.id);
-            export_html_file(&path, template, page.metadata.is_index, &cfg, &ctx).await
+            let template = cfg
+                .content_path
+                .join("templates")
+                .join(&page.metadata.template);
+            export_html_file(&path, &template, page.metadata.is_index, &cfg, &ctx).await
         }));
     }
 
@@ -291,12 +263,7 @@ async fn export_pages_to_html(
     Ok(())
 }
 
-async fn export_posts_to_html(
-    cfg: &Config,
-    ctx: &mut Context,
-    template_cache: &HashMap<PathBuf, String>,
-    posts: Vec<Post>,
-) -> Result<()> {
+async fn export_posts_to_html(cfg: &Config, ctx: &mut Context, posts: Vec<Post>) -> Result<()> {
     let mut handles = Vec::new();
 
     for post in posts {
@@ -304,10 +271,6 @@ async fn export_posts_to_html(
 
         let cfg = cfg.clone();
         let mut ctx = ctx.clone();
-        let template = template_cache
-            .get(&post.metadata.template)
-            .expect("templates are loaded")
-            .clone();
 
         handles.push(tokio::spawn(async move {
             // Insert metadata as current context for templating
@@ -318,7 +281,11 @@ async fn export_posts_to_html(
             ctx.insert("date", format_date_iso8601(&post.metadata.date));
 
             let path = cfg.output_path.join("posts").join(&post.metadata.id);
-            export_html_file(&path, template, false, &cfg, &ctx).await
+            let template = cfg
+                .content_path
+                .join("templates")
+                .join(&post.metadata.template);
+            export_html_file(&path, &template, false, &cfg, &ctx).await
         }));
     }
 
