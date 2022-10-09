@@ -1,24 +1,34 @@
-use std::cmp::Ordering;
-use std::collections::{hash_map, HashMap};
-use std::os::unix::prelude::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::{
+    cmp::Ordering,
+    collections::{hash_map, HashMap},
+    os::unix::prelude::OsStrExt,
+    path::{Path, PathBuf},
+};
 
 use log::{debug, error, info};
 use pulldown_cmark::{html, Options, Parser};
 use serde::{Deserialize, Serialize};
 use template::Context;
-use time::format_description::well_known::iso8601::{self, EncodedConfig, TimePrecision};
-use time::format_description::well_known::Iso8601;
-use time::format_description::FormatItem;
-use time::macros::format_description;
-use time::OffsetDateTime;
+use time::{
+    format_description::{
+        well_known::{
+            iso8601::{self, EncodedConfig, TimePrecision},
+            Iso8601,
+        },
+        FormatItem,
+    },
+    macros::format_description,
+    OffsetDateTime,
+};
 
 mod config;
 mod error;
 mod template;
 
-use crate::config::Config;
-use crate::error::{Error, Result};
+use crate::{
+    config::Config,
+    error::{Error, Result},
+};
 
 /// Date format used to display dates.
 const DATE_FORMAT: &[FormatItem<'static>] =

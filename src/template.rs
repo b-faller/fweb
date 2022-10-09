@@ -147,9 +147,8 @@ pub async fn template(config: &Config, ctx: &Context, mut input: String) -> erro
 
 #[cfg(test)]
 mod tests {
-    use crate::config;
-
     use super::*;
+    use crate::config;
 
     fn dummy_config() -> Config {
         Config {
@@ -218,9 +217,11 @@ mod tests {
     async fn test_nonexistant_tag() {
         let input = "{{ test }}";
         let shortcode: Shortcode = input.parse().unwrap();
-        assert!(shortcode
-            .to_html(&dummy_config(), &Context::new())
-            .await
-            .is_err());
+        assert!(
+            shortcode
+                .to_html(&dummy_config(), &Context::new())
+                .await
+                .is_err()
+        );
     }
 }
