@@ -127,26 +127,15 @@ impl Website {
         let to = self.config.output_path.clone();
         let mirror_assets_handle = tokio::spawn(async move { mirror_assets(from, to).await });
 
-        // Read pages.
+        // Read and parse pages and posts
+        let posts_dir = self.config.content_path.join("posts");
         let pages_dir = self.config.content_path.join("pages");
-        let mut pages = handle_pages(pages_dir).await?;
-        // Sort posts based on their date descending.
-        pages.sort_unstable_by(|p1, p2| {
-            let f1 = p1.metadata.filepath.file_name().expect("page has filename");
-            let f2 = p2.metadata.filepath.file_name().expect("page has filename");
-            // Sort '_' first
-            match (f1.as_bytes(), f2.as_bytes()) {
-                ([b'_', ..], _) => Ordering::Less,
-                (_, [b'_', ..]) => Ordering::Greater,
-                (f1, f2) => f1.cmp(f2),
-            }
-        });
-
-        // Read posts.
-        let posts_dir = self.config.content_path.join("posts/");
-        let mut posts = handle_posts(&posts_dir).await?;
-        // Sort posts based on their date descending.
-        posts.sort_unstable_by(|p1, p2| p2.metadata.date.cmp(&p1.metadata.date));
+        let (posts, pages) = tokio::try_join!(
+            tokio::spawn(async move { load_and_parse_posts(posts_dir).await }),
+            tokio::spawn(async move { load_and_parse_pages(pages_dir).await }),
+        )
+        .map_err(Error::Join)?;
+        let (posts, pages) = (posts?, pages?);
 
         // Store templates in a cache
         let templates_dir = self.config.content_path.join("templates");
@@ -418,7 +407,7 @@ async fn parse_page(in_page: impl AsRef<Path>) -> Result<Page> {
     Ok(page)
 }
 
-async fn handle_pages(pages_dir: impl AsRef<Path>) -> Result<Vec<Page>> {
+async fn load_and_parse_pages(pages_dir: impl AsRef<Path>) -> Result<Vec<Page>> {
     let mut handles = vec![];
     let mut pages = vec![];
 
@@ -436,10 +425,23 @@ async fn handle_pages(pages_dir: impl AsRef<Path>) -> Result<Vec<Page>> {
         }
     }
 
+    // Wait for all pages to be done with processing
     for handle in handles {
         let page = handle.await.map_err(Error::Join)??;
         pages.push(page);
     }
+
+    // Sort posts based on their date descending.
+    pages.sort_unstable_by(|p1, p2| {
+        let f1 = p1.metadata.filepath.file_name().expect("page has filename");
+        let f2 = p2.metadata.filepath.file_name().expect("page has filename");
+        // Sort '_' first
+        match (f1.as_bytes(), f2.as_bytes()) {
+            ([b'_', ..], _) => Ordering::Less,
+            (_, [b'_', ..]) => Ordering::Greater,
+            (f1, f2) => f1.cmp(f2),
+        }
+    });
 
     Ok(pages)
 }
@@ -464,7 +466,7 @@ async fn parse_post(in_post: impl AsRef<Path>) -> Result<Post> {
     Ok(post)
 }
 
-async fn handle_posts(posts_dir: impl AsRef<Path>) -> Result<Vec<Post>> {
+async fn load_and_parse_posts(posts_dir: impl AsRef<Path>) -> Result<Vec<Post>> {
     let mut handles = vec![];
     let mut posts = vec![];
 
@@ -482,10 +484,14 @@ async fn handle_posts(posts_dir: impl AsRef<Path>) -> Result<Vec<Post>> {
         }
     }
 
+    // all posts to be done with processing
     for handle in handles {
         let page = handle.await.map_err(Error::Join)??;
         posts.push(page);
     }
+
+    // Sort posts based on their date descending.
+    posts.sort_unstable_by(|p1, p2| p2.metadata.date.cmp(&p1.metadata.date));
 
     Ok(posts)
 }
