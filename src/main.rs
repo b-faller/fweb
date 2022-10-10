@@ -1,11 +1,12 @@
 use std::{
     cmp::Ordering,
+    ffi::OsStr,
     os::unix::prelude::OsStrExt,
     path::{Path, PathBuf},
 };
 
 use log::{debug, error, info};
-use pulldown_cmark::{html, Options, Parser};
+use pulldown_cmark::{Options, Parser};
 use serde::{Deserialize, Serialize};
 use template::Context;
 use time::{
@@ -41,71 +42,136 @@ const DATE_ISO_CONFIG: EncodedConfig = iso8601::Config::DEFAULT
     })
     .encode();
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PostMetadata {
-    /// ID used for URLs.
-    id: String,
-
-    /// The path to the markdown input file.
-    #[serde(skip_deserializing)]
-    filepath: PathBuf,
-
-    /// Template file to use.
-    #[serde(default = "default_post_template")]
-    template: PathBuf,
-
-    /// Post title.
-    title: String,
-
-    /// Excerpt of the post content.
-    excerpt: String,
-    #[serde(with = "time::serde::rfc3339")]
-    date: OffsetDateTime,
-}
-
-fn default_post_template() -> PathBuf {
-    "post.html".into()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Post {
-    metadata: PostMetadata,
-    content: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct PageMetadata {
     /// ID used for URLs.
     id: String,
 
+    /// Post title.
+    title: String,
+
+    /// If the page should be shown in the navigation.
+    #[serde(default)]
+    display_in_nav: bool,
+
+    /// Excerpt of the post content.
+    #[serde(default)]
+    excerpt: Option<String>,
+
+    /// Date when the page was written
+    #[serde(default)]
+    #[serde(deserialize_with = "optional_datetime")]
+    date: Option<OffsetDateTime>,
+
     /// The path to the markdown input file.
+    ///
+    /// This path is relative to the `content/`
     #[serde(skip_deserializing)]
     filepath: PathBuf,
 
     /// Template file to use.
+    ///
+    /// This path is relative to `templates/`
     #[serde(default = "default_page_template")]
     template: PathBuf,
-
-    /// Page title.
-    title: String,
-
-    /// Whether the page is the base `index.html`.
-    #[serde(skip_deserializing)]
-    is_index: bool,
-
-    /// If the page should be shown in the navigation.
-    #[serde(default)]
-    hide: bool,
 }
 
 fn default_page_template() -> PathBuf {
     "page.html".into()
 }
 
-#[derive(Debug, Clone)]
+fn optional_datetime<'de, D>(d: D) -> std::result::Result<Option<OffsetDateTime>, D::Error>
+where
+    D: serde::de::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct Wrapper(#[serde(with = "time::serde::iso8601")] OffsetDateTime);
+
+    let wrapper = Option::deserialize(d)?;
+    Ok(wrapper.map(|Wrapper(external)| external))
+}
+
+/// A page is an HTML file within a folder.
+#[derive(Debug, Clone, Deserialize)]
 struct Page {
     metadata: PageMetadata,
-    content: String,
+    html: String,
+}
+
+impl Page {
+    async fn parse_md(content_dir: impl AsRef<Path>, relpath: impl AsRef<Path>) -> Result<Self> {
+        let file = content_dir.as_ref().join(&relpath);
+        let content = tokio::fs::read_to_string(&file)
+            .await
+            .map_err(|e| Error::ReadInput(relpath.as_ref().to_path_buf(), e))?;
+
+        let (frontmatter, markdown) = parse_file(&content, file)?;
+        let mut metadata: PageMetadata = toml::from_str(frontmatter)
+            .map_err(|e| Error::ParseMetadata(relpath.as_ref().to_path_buf(), e))?;
+        metadata.filepath = relpath.as_ref().to_path_buf();
+
+        Ok(Self {
+            metadata,
+            html: convert_markdown(markdown),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IndexMetadata {
+    /// Page title.
+    title: String,
+
+    /// If the index should be shown in the navigation.
+    #[serde(default)]
+    display_in_nav: bool,
+
+    /// Template file to use.
+    ///
+    /// This path is relative to `templates/`
+    #[serde(default = "default_index_template")]
+    template: PathBuf,
+
+    /// The path to the markdown input file.
+    ///
+    /// This path is relative to `content/`
+    #[serde(skip_deserializing)]
+    filepath: PathBuf,
+}
+
+fn default_index_template() -> PathBuf {
+    "index.html".into()
+}
+
+/// An index is the `_index.html` within a folder in the content.
+#[derive(Debug, Clone)]
+struct Index {
+    metadata: IndexMetadata,
+    html: String,
+    pages: Vec<Page>,
+}
+
+impl Index {
+    /// Reads and parses an input markdown file.
+    ///
+    /// Note: This does not read in any pages
+    async fn parse_md(content_dir: impl AsRef<Path>, relpath: impl AsRef<Path>) -> Result<Self> {
+        let file = content_dir.as_ref().join(&relpath);
+        let content = tokio::fs::read_to_string(&file)
+            .await
+            .map_err(|e| Error::ReadInput(relpath.as_ref().to_path_buf(), e))?;
+
+        let (frontmatter, markdown) = parse_file(&content, file)?;
+        let mut metadata: IndexMetadata = toml::from_str(frontmatter)
+            .map_err(|e| Error::ParseMetadata(relpath.as_ref().to_path_buf(), e))?;
+        metadata.filepath = relpath.as_ref().to_path_buf();
+
+        Ok(Self {
+            metadata,
+            html: convert_markdown(markdown),
+            pages: Vec::new(),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -127,48 +193,67 @@ impl Website {
         let to = self.config.output_path.clone();
         let mirror_assets_handle = tokio::spawn(async move { mirror_assets(from, to).await });
 
-        // Read and parse pages and posts
-        let posts_dir = self.config.content_path.join("posts");
-        let pages_dir = self.config.content_path.join("pages");
-        let (posts, pages) = tokio::try_join!(
-            tokio::spawn(async move { load_and_parse_posts(posts_dir).await }),
-            tokio::spawn(async move { load_and_parse_pages(pages_dir).await }),
-        )
-        .map_err(Error::Join)?;
-        let (posts, pages) = (posts?, pages?);
+        // Read and parse content
+        let content_dir = self.config.content_path.join("content");
+        let indices = load_and_parse_content(content_dir).await?;
 
         // Fill templating context
         let mut ctx = template::Context::new();
         ctx.insert(
             "nav",
-            pages
+            indices
                 .iter()
-                .map(|p| {
-                    if p.metadata.is_index {
-                        format!("<a href=\"/\">{}</a>\n", p.metadata.title)
-                    } else if !p.metadata.hide {
-                        format!("<a href=\"/{}/\">{}</a>\n", p.metadata.id, p.metadata.title)
+                .filter(|index| index.metadata.display_in_nav)
+                .map(|index| {
+                    let path = PathBuf::from("/")
+                        .join(index.metadata.filepath.parent().unwrap())
+                        .display()
+                        .to_string();
+                    let mut nav = String::new();
+                    if path.len() > 1 {
+                        nav += &format!("<a href=\"{}/\">{}</a>\n", path, index.metadata.title);
                     } else {
-                        "".to_string()
+                        nav += &format!("<a href=\"/\">{}</a>\n", index.metadata.title);
                     }
+                    nav += &index
+                        .pages
+                        .iter()
+                        .filter(|page| page.metadata.display_in_nav)
+                        .map(|page| {
+                            let path = PathBuf::from("/")
+                                .join(index.metadata.filepath.parent().unwrap())
+                                .join(&page.metadata.id);
+                            format!(
+                                "<a href=\"{}/\">{}</a>\n",
+                                path.display(),
+                                page.metadata.title
+                            )
+                        })
+                        .collect::<String>();
+                    nav
                 })
                 .collect::<String>(),
         );
         ctx.insert(
             "articles",
-            posts
+            indices
                 .iter()
-                .map(|post| {
+                .flat_map(|index| &index.pages)
+                .filter(|page| page.metadata.date.is_some() && page.metadata.excerpt.is_some())
+                .map(|page| {
                     // Append current metadata as HTML to post TOC
+                    let path = PathBuf::from("/")
+                        .join(page.metadata.filepath.parent().unwrap())
+                        .join(&page.metadata.id);
                     format!(
-                        "<hgroup>\n<h3><a href=\"/posts/{id}\">{title}</a></h3>\n<p><small><time \
-                         datetime=\"{iso_date}\">{date}</time></small></p>\n</hgroup>\\
-                         n<p>{excerpt}</p>\n",
-                        id = post.metadata.id,
-                        title = post.metadata.title,
-                        excerpt = post.metadata.excerpt,
-                        iso_date = format_date_iso8601(&post.metadata.date),
-                        date = format_date_utc(&post.metadata.date),
+                        "<hgroup>\n<h3><a href=\"{path}/\">{title}</a></h3>\n<p><small><time \
+                         datetime=\"{date_iso}\">{date_utc}</time></small></p>\n</\
+                         hgroup><p>{excerpt}</p>\n",
+                        path = path.display(),
+                        title = page.metadata.title,
+                        date_iso = format_date_iso8601(&page.metadata.date.unwrap()),
+                        date_utc = format_date_utc(&page.metadata.date.unwrap()),
+                        excerpt = page.metadata.excerpt.as_ref().unwrap(),
                     )
                 })
                 .collect(),
@@ -179,13 +264,193 @@ impl Website {
             self.config.site_info.description.to_string(),
         );
 
-        export_posts_to_html(&self.config, &mut ctx, posts).await?;
-        export_pages_to_html(&self.config, &mut ctx, pages).await?;
+        export_indices_to_html(&self.config, ctx, indices).await?;
 
         mirror_assets_handle.await.map_err(Error::Join)??;
 
         Ok(())
     }
+}
+
+/// Loads and parses all content in the `content_dir`.
+///
+/// Returns the base index which contains all further pages.
+async fn load_and_parse_content(content_dir: PathBuf) -> Result<Vec<Index>> {
+    // Discovered indices
+    let mut indices = Vec::new();
+    // Stack storing the directories which remain to be processed
+    let mut stack = vec![content_dir.clone()];
+
+    while let Some(dir) = stack.pop() {
+        let mut index = None;
+        let mut pages_handles = Vec::new();
+
+        // Iterate over the current directory entries
+        let mut entries = tokio::fs::read_dir(&dir)
+            .await
+            .map_err(|e| Error::ReadDirectory(dir.clone(), e))?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| Error::ReadDirectory(dir.clone(), e))?
+        {
+            let file = entry.path();
+            if file.is_dir() {
+                stack.push(file);
+            } else if file.is_file() {
+                if file.file_name() == Some(OsStr::new("_index.md")) {
+                    index = Some(file);
+                } else if file.extension() == Some(OsStr::new("md")) {
+                    let content_dir = content_dir.clone();
+                    let relpath = file
+                        .strip_prefix(&content_dir)
+                        .expect("starts with content directory")
+                        .to_path_buf();
+                    pages_handles.push(tokio::spawn(async move {
+                        Page::parse_md(content_dir, relpath).await
+                    }));
+                }
+            }
+        }
+
+        let mut pages = Vec::with_capacity(pages_handles.len());
+        for handle in pages_handles {
+            pages.push(handle.await.map_err(Error::Join)??);
+        }
+
+        // Sort pages based on their date descending.
+        pages.sort_unstable_by(|p1, p2| p2.metadata.date.cmp(&p1.metadata.date));
+
+        // Read and process the index
+        if let Some(file) = index {
+            let content_dir = content_dir.clone();
+            let relpath = file
+                .strip_prefix(&content_dir)
+                .expect("starts with content directory")
+                .to_path_buf();
+
+            let mut index =
+                tokio::spawn(async move { Index::parse_md(content_dir, relpath).await })
+                    .await
+                    .map_err(Error::Join)??;
+            index.pages = pages;
+
+            indices.push(index);
+        }
+    }
+
+    // Sort posts based on their date descending.
+    indices.sort_unstable_by(|i1, i2| {
+        let f1 = i1.metadata.filepath.file_name().expect("page has filename");
+        let f2 = i2.metadata.filepath.file_name().expect("page has filename");
+        // Sort '_' first
+        let char_cmp = |a, b| match (a, b) {
+            (b'_', b'_') => Ordering::Equal,
+            (b'_', _) => Ordering::Less,
+            (_, b'_') => Ordering::Greater,
+            (a, b) => a.cmp(&b),
+        };
+        for (a, b) in f1.as_bytes().iter().zip(f2.as_bytes().iter()) {
+            let res = char_cmp(*a, *b);
+            if res != Ordering::Equal {
+                return res;
+            }
+        }
+        Ordering::Equal
+    });
+
+    Ok(indices)
+}
+
+/// Write all indices to disk.
+async fn export_indices_to_html(
+    config: &Config,
+    mut ctx: Context,
+    indices: Vec<Index>,
+) -> Result<()> {
+    for index in indices {
+        debug!("Building index {:?}", index);
+
+        // Create filepath to store the index.html
+        let dir = config.output_path.join(
+            index
+                .metadata
+                .filepath
+                .parent()
+                .expect("index always has a parent"),
+        );
+        let file = dir.join("index.html");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| Error::CreateDirectory(dir, e))?;
+
+        // Build index context
+        ctx.insert("title", index.metadata.title.to_string());
+        ctx.insert("content", index.html.to_string());
+
+        // Apply templating
+        let templates_dir = config.content_path.join("templates");
+        let template_path = templates_dir.join(&index.metadata.template);
+        let template = tokio::fs::read_to_string(&template_path)
+            .await
+            .map_err(|e| Error::ReadInput(template_path, e))?;
+        let html = template::template(config, &ctx, template).await?;
+
+        // Write index.html
+        tokio::fs::write(&file, html)
+            .await
+            .map_err(|e| Error::WriteFile(file, e))?;
+
+        // Export pages
+        let mut handles = Vec::new();
+        for page in index.pages {
+            let config = config.clone();
+            let mut ctx = ctx.clone();
+            let templates_dir = templates_dir.clone();
+
+            handles.push(tokio::spawn(async move {
+                debug!("Building page '{:?}'", &page.metadata);
+
+                // Build page context
+                ctx.insert("content", page.html.to_string());
+                ctx.insert("title", page.metadata.title.to_string());
+                if let Some(excerpt) = page.metadata.excerpt {
+                    ctx.insert("excerpt", excerpt);
+                }
+                if let Some(date) = page.metadata.date {
+                    ctx.insert("date_iso8601", format_date_iso8601(&date));
+                    ctx.insert("date", format_date_utc(&date));
+                }
+
+                // Apply templating
+                let template_path = templates_dir.join(&page.metadata.template);
+                let template = tokio::fs::read_to_string(&template_path)
+                    .await
+                    .map_err(|e| Error::ReadInput(template_path, e))?;
+                let html = template::template(&config, &ctx, template).await?;
+
+                // Write page HTML to file
+                let dir = config
+                    .output_path
+                    .join(page.metadata.filepath.parent().unwrap())
+                    .join(page.metadata.id);
+                tokio::fs::create_dir_all(dir.clone())
+                    .await
+                    .map_err(|e| Error::CreateDirectory(dir.clone(), e))?;
+                let path = dir.join("index.html");
+                tokio::fs::write(&path, html)
+                    .await
+                    .map_err(|e| Error::WriteFile(path, e))?;
+
+                Result::Ok(())
+            }))
+        }
+
+        for handle in handles {
+            handle.await.map_err(Error::Join)??;
+        }
+    }
+    Ok(())
 }
 
 fn format_date_iso8601(date: &OffsetDateTime) -> String {
@@ -197,104 +462,6 @@ fn format_date_utc(date: &OffsetDateTime) -> String {
     date.to_offset(time::macros::offset!(UTC))
         .format(&DATE_FORMAT)
         .expect("date already validated")
-}
-
-async fn export_html_file(
-    path: &Path,
-    template: &Path,
-    is_index: bool,
-    cfg: &Config,
-    ctx: &Context,
-) -> Result<()> {
-    // Apply templating
-    let template = tokio::fs::read_to_string(template)
-        .await
-        .map_err(|e| Error::ReadInput(template.to_path_buf(), e))?;
-    let html = template::template(cfg, ctx, template).await?;
-
-    if is_index {
-        let path = cfg.output_path.join("index.html");
-        tokio::fs::write(&path, html)
-            .await
-            .map_err(|e| Error::WriteFile(path, e))?;
-    } else {
-        tokio::fs::create_dir_all(&path)
-            .await
-            .map_err(|e| Error::CreateDirectory(path.to_path_buf(), e))?;
-        let index_file_path = path.join("index.html");
-        tokio::fs::write(&index_file_path, html)
-            .await
-            .map_err(|e| Error::WriteFile(index_file_path, e))?;
-    }
-
-    Ok(())
-}
-
-async fn export_pages_to_html(cfg: &Config, ctx: &mut Context, pages: Vec<Page>) -> Result<()> {
-    let mut handles = Vec::new();
-
-    for page in pages {
-        debug!("Building page '{:?}'", &page.metadata);
-
-        let cfg = cfg.clone();
-        let mut ctx = ctx.clone();
-
-        handles.push(tokio::spawn(async move {
-            debug!("Building page '{:?}'", &page.metadata);
-
-            // Insert page metadata into context for templating
-            ctx.insert("title", page.metadata.title.to_string());
-            ctx.insert("content", page.content.to_string());
-
-            let path = cfg.output_path.join(&page.metadata.id);
-            let template = cfg
-                .content_path
-                .join("templates")
-                .join(&page.metadata.template);
-            export_html_file(&path, &template, page.metadata.is_index, &cfg, &ctx).await
-        }));
-    }
-
-    // Wait for all processing to complete
-    for task in handles {
-        task.await.map_err(Error::Join)??;
-    }
-
-    Ok(())
-}
-
-async fn export_posts_to_html(cfg: &Config, ctx: &mut Context, posts: Vec<Post>) -> Result<()> {
-    let mut handles = Vec::new();
-
-    for post in posts {
-        debug!("Building post '{:?}'", &post.metadata);
-
-        let cfg = cfg.clone();
-        let mut ctx = ctx.clone();
-
-        handles.push(tokio::spawn(async move {
-            // Insert metadata as current context for templating
-            ctx.insert("content", post.content.to_string());
-            ctx.insert("title", post.metadata.title.to_string());
-            ctx.insert("excerpt", post.metadata.excerpt.to_string());
-            ctx.insert("date_iso8601", format_date_iso8601(&post.metadata.date));
-            ctx.insert("date", format_date_iso8601(&post.metadata.date));
-
-            let path = cfg.output_path.join("posts").join(&post.metadata.id);
-            let template = cfg
-                .content_path
-                .join("templates")
-                .join(&post.metadata.template);
-            export_html_file(&path, &template, false, &cfg, &ctx).await
-        }));
-    }
-
-    // Wait for all processing to complete
-    for task in handles {
-        task.await.map_err(Error::Join)??;
-    }
-
-    Ok(())
 }
 
 /// Mirror the assets fully.
@@ -349,7 +516,7 @@ fn parse_file(input: &str, filepath: impl AsRef<Path>) -> Result<(&str, &str)> {
     Ok((frontmatter, markdown))
 }
 
-async fn convert_markdown(markdown: &str) -> String {
+fn convert_markdown(markdown: &str) -> String {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_FOOTNOTES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
@@ -358,120 +525,10 @@ async fn convert_markdown(markdown: &str) -> String {
     let parser = Parser::new_ext(markdown, options);
 
     // Write to String buffer.
-    let mut html_output = String::new();
-    html::push_html(&mut html_output, parser);
+    let mut html = String::new();
+    pulldown_cmark::html::push_html(&mut html, parser);
 
-    html_output
-}
-
-async fn parse_page(in_page: impl AsRef<Path>) -> Result<Page> {
-    let in_page = in_page.as_ref();
-    let input = tokio::fs::read_to_string(&in_page)
-        .await
-        .map_err(|e| Error::ReadInput(in_page.into(), e))?;
-
-    let (frontmatter, markdown) = parse_file(&input, &in_page)?;
-    let mut metadata: PageMetadata =
-        toml::from_str(frontmatter).map_err(|e| Error::ParseMetadata(in_page.into(), e))?;
-    metadata.is_index = in_page.file_name().expect("file must exist") == "_index.md";
-    metadata.filepath = in_page.to_path_buf();
-
-    let html = convert_markdown(markdown).await;
-    let page = Page {
-        metadata,
-        content: html,
-    };
-
-    Ok(page)
-}
-
-async fn load_and_parse_pages(pages_dir: impl AsRef<Path>) -> Result<Vec<Page>> {
-    let mut handles = vec![];
-    let mut pages = vec![];
-
-    let mut entries = tokio::fs::read_dir(&pages_dir)
-        .await
-        .map_err(|e| Error::ReadDirectory(pages_dir.as_ref().into(), e))?;
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|e| Error::ReadDirectory(pages_dir.as_ref().into(), e))?
-    {
-        let path = entry.path();
-        if path.is_file() {
-            handles.push(tokio::spawn(async move { parse_page(&path).await }));
-        }
-    }
-
-    // Wait for all pages to be done with processing
-    for handle in handles {
-        let page = handle.await.map_err(Error::Join)??;
-        pages.push(page);
-    }
-
-    // Sort posts based on their date descending.
-    pages.sort_unstable_by(|p1, p2| {
-        let f1 = p1.metadata.filepath.file_name().expect("page has filename");
-        let f2 = p2.metadata.filepath.file_name().expect("page has filename");
-        // Sort '_' first
-        match (f1.as_bytes(), f2.as_bytes()) {
-            ([b'_', ..], _) => Ordering::Less,
-            (_, [b'_', ..]) => Ordering::Greater,
-            (f1, f2) => f1.cmp(f2),
-        }
-    });
-
-    Ok(pages)
-}
-
-async fn parse_post(in_post: impl AsRef<Path>) -> Result<Post> {
-    let in_post = in_post.as_ref();
-    let input = tokio::fs::read_to_string(&in_post)
-        .await
-        .map_err(|e| Error::ReadInput(in_post.into(), e))?;
-
-    let (frontmatter, markdown) = parse_file(&input, &in_post)?;
-    let mut metadata: PostMetadata =
-        toml::from_str(frontmatter).map_err(|e| Error::ParseMetadata(in_post.into(), e))?;
-    metadata.filepath = in_post.to_path_buf();
-
-    let html = convert_markdown(markdown).await;
-    let post = Post {
-        metadata,
-        content: html,
-    };
-
-    Ok(post)
-}
-
-async fn load_and_parse_posts(posts_dir: impl AsRef<Path>) -> Result<Vec<Post>> {
-    let mut handles = vec![];
-    let mut posts = vec![];
-
-    let mut entries = tokio::fs::read_dir(&posts_dir)
-        .await
-        .map_err(|e| Error::ReadDirectory(posts_dir.as_ref().into(), e))?;
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|e| Error::ReadDirectory(posts_dir.as_ref().into(), e))?
-    {
-        let path = entry.path();
-        if path.is_file() {
-            handles.push(tokio::spawn(async move { parse_post(&path).await }));
-        }
-    }
-
-    // all posts to be done with processing
-    for handle in handles {
-        let page = handle.await.map_err(Error::Join)??;
-        posts.push(page);
-    }
-
-    // Sort posts based on their date descending.
-    posts.sort_unstable_by(|p1, p2| p2.metadata.date.cmp(&p1.metadata.date));
-
-    Ok(posts)
+    html
 }
 
 /// Read and parse site config
