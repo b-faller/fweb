@@ -1,13 +1,11 @@
 use std::{
-    cmp::Ordering,
     ffi::OsStr,
-    os::unix::prelude::OsStrExt,
     path::{Path, PathBuf},
 };
 
 use log::{debug, error, info};
 use pulldown_cmark::{Options, Parser};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use template::Context;
 use time::{
     format_description::{
@@ -43,6 +41,19 @@ const DATE_ISO_CONFIG: EncodedConfig = iso8601::Config::DEFAULT
     .encode();
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SortOrder {
+    /// Sorts pages by their title
+    Title,
+
+    /// Sorts pages by their date
+    Date,
+
+    /// Sorts pages by a weight
+    Weight,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct PageMetadata {
     /// ID used for URLs.
     id: String,
@@ -51,8 +62,18 @@ struct PageMetadata {
     title: String,
 
     /// If the page should be shown in the navigation.
+    ///
+    /// Given as an positive number at which position the page should be shown.
+    /// Note: If two indices or pages have the same number, the ordering is
+    /// unspecified between those two entries.
     #[serde(default)]
-    display_in_nav: bool,
+    display_in_nav: Option<usize>,
+
+    /// A page weight is simply a number associated with the page.
+    ///
+    /// This can be used to sort pages, in this case the pages are ordered by
+    /// their weight in normal numerical order
+    weight: Option<i32>,
 
     /// Excerpt of the post content.
     #[serde(default)]
@@ -117,14 +138,21 @@ impl Page {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct IndexMetadata {
     /// Page title.
     title: String,
 
     /// If the index should be shown in the navigation.
+    ///
+    /// Given as an positive number at which position the page should be shown.
+    /// Note: If two indices or pages have the same number, the ordering is
+    /// unspecified between those two entries.
     #[serde(default)]
-    display_in_nav: bool,
+    display_in_nav: Option<usize>,
+
+    /// Sort pages by the specified order
+    sort_by: SortOrder,
 
     /// Template file to use.
     ///
@@ -199,65 +227,8 @@ impl Website {
 
         // Fill templating context
         let mut ctx = template::Context::new();
-        ctx.insert(
-            "nav",
-            indices
-                .iter()
-                .filter(|index| index.metadata.display_in_nav)
-                .map(|index| {
-                    let path = PathBuf::from("/")
-                        .join(index.metadata.filepath.parent().unwrap())
-                        .display()
-                        .to_string();
-                    let mut nav = String::new();
-                    if path.len() > 1 {
-                        nav += &format!("<a href=\"{}/\">{}</a>\n", path, index.metadata.title);
-                    } else {
-                        nav += &format!("<a href=\"/\">{}</a>\n", index.metadata.title);
-                    }
-                    nav += &index
-                        .pages
-                        .iter()
-                        .filter(|page| page.metadata.display_in_nav)
-                        .map(|page| {
-                            let path = PathBuf::from("/")
-                                .join(index.metadata.filepath.parent().unwrap())
-                                .join(&page.metadata.id);
-                            format!(
-                                "<a href=\"{}/\">{}</a>\n",
-                                path.display(),
-                                page.metadata.title
-                            )
-                        })
-                        .collect::<String>();
-                    nav
-                })
-                .collect::<String>(),
-        );
-        ctx.insert(
-            "articles",
-            indices
-                .iter()
-                .flat_map(|index| &index.pages)
-                .filter(|page| page.metadata.date.is_some() && page.metadata.excerpt.is_some())
-                .map(|page| {
-                    // Append current metadata as HTML to post TOC
-                    let path = PathBuf::from("/")
-                        .join(page.metadata.filepath.parent().unwrap())
-                        .join(&page.metadata.id);
-                    format!(
-                        "<hgroup>\n<h3><a href=\"{path}/\">{title}</a></h3>\n<p><small><time \
-                         datetime=\"{date_iso}\">{date_utc}</time></small></p>\n</\
-                         hgroup><p>{excerpt}</p>\n",
-                        path = path.display(),
-                        title = page.metadata.title,
-                        date_iso = format_date_iso8601(&page.metadata.date.unwrap()),
-                        date_utc = format_date_utc(&page.metadata.date.unwrap()),
-                        excerpt = page.metadata.excerpt.as_ref().unwrap(),
-                    )
-                })
-                .collect(),
-        );
+        ctx.insert("nav", build_navigation(&indices));
+        ctx.insert("articles", build_article_list(&indices));
         ctx.insert("site_title", self.config.site_info.title.to_string());
         ctx.insert(
             "site_description",
@@ -318,9 +289,6 @@ async fn load_and_parse_content(content_dir: PathBuf) -> Result<Vec<Index>> {
             pages.push(handle.await.map_err(Error::Join)??);
         }
 
-        // Sort pages based on their date descending.
-        pages.sort_unstable_by(|p1, p2| p2.metadata.date.cmp(&p1.metadata.date));
-
         // Read and process the index
         if let Some(file) = index {
             let content_dir = content_dir.clone();
@@ -335,29 +303,23 @@ async fn load_and_parse_content(content_dir: PathBuf) -> Result<Vec<Index>> {
                     .map_err(Error::Join)??;
             index.pages = pages;
 
+            // Sort pages
+            // We use unstable here since _I suppose_ pages are already in arbitrary order
+            // coming from the async tasks.
+            index.pages.sort_unstable_by(|p1, p2| {
+                match index.metadata.sort_by {
+                    SortOrder::Title => p1.metadata.title.cmp(&p2.metadata.title),
+                    SortOrder::Date => {
+                        // Sort pages based on their date descending.
+                        p2.metadata.date.cmp(&p1.metadata.date)
+                    }
+                    SortOrder::Weight => p1.metadata.weight.cmp(&p2.metadata.weight),
+                }
+            });
+
             indices.push(index);
         }
     }
-
-    // Sort posts based on their date descending.
-    indices.sort_unstable_by(|i1, i2| {
-        let f1 = i1.metadata.filepath.file_name().expect("page has filename");
-        let f2 = i2.metadata.filepath.file_name().expect("page has filename");
-        // Sort '_' first
-        let char_cmp = |a, b| match (a, b) {
-            (b'_', b'_') => Ordering::Equal,
-            (b'_', _) => Ordering::Less,
-            (_, b'_') => Ordering::Greater,
-            (a, b) => a.cmp(&b),
-        };
-        for (a, b) in f1.as_bytes().iter().zip(f2.as_bytes().iter()) {
-            let res = char_cmp(*a, *b);
-            if res != Ordering::Equal {
-                return res;
-            }
-        }
-        Ordering::Equal
-    });
 
     Ok(indices)
 }
@@ -451,6 +413,75 @@ async fn export_indices_to_html(
         }
     }
     Ok(())
+}
+
+/// Create the HTML for the navigation based on the indices and pages.
+fn build_navigation(indices: &[Index]) -> String {
+    let mut navs = Vec::new();
+
+    indices
+        .iter()
+        .flat_map(|index| index.metadata.display_in_nav.map(|i| (i, index)))
+        .for_each(|(i, index)| {
+            let path = PathBuf::from("/")
+                .join(index.metadata.filepath.parent().unwrap())
+                .display()
+                .to_string();
+            if path.len() > 1 {
+                navs.push((
+                    i,
+                    format!("<a href=\"{}/\">{}</a>\n", path, index.metadata.title),
+                ));
+            } else {
+                navs.push((i, format!("<a href=\"/\">{}</a>\n", index.metadata.title)));
+            }
+            index
+                .pages
+                .iter()
+                .flat_map(|page| page.metadata.display_in_nav.map(|i| (i, page)))
+                .for_each(|(i, page)| {
+                    let path = PathBuf::from("/")
+                        .join(index.metadata.filepath.parent().unwrap())
+                        .join(&page.metadata.id);
+                    navs.push((
+                        i,
+                        format!(
+                            "<a href=\"{}/\">{}</a>\n",
+                            path.display(),
+                            page.metadata.title
+                        ),
+                    ));
+                });
+        });
+
+    navs.sort_by_key(|(i, _nav)| *i);
+    navs.into_iter().map(|(_i, nav)| nav).collect()
+}
+
+/// Build an HTML list of articles.
+fn build_article_list(indices: &[Index]) -> String {
+    indices
+        .iter()
+        .flat_map(|index| &index.pages)
+        .filter(|page| page.metadata.date.is_some() && page.metadata.excerpt.is_some())
+        .map(|page| {
+            // Append current metadata as HTML to post TOC
+            let path = PathBuf::from("/")
+                .join(page.metadata.filepath.parent().unwrap())
+                .join(&page.metadata.id);
+            format!(
+                "<hgroup>\n<h3><a href=\"{path}/\">{title}</a></h3>\n<p><small><time \
+                 datetime=\"{date_iso}\">{date_utc}</time></small></p>\n</hgroup><p>{excerpt}</p>\\
+                 \
+                 n",
+                path = path.display(),
+                title = page.metadata.title,
+                date_iso = format_date_iso8601(&page.metadata.date.unwrap()),
+                date_utc = format_date_utc(&page.metadata.date.unwrap()),
+                excerpt = page.metadata.excerpt.as_ref().unwrap(),
+            )
+        })
+        .collect()
 }
 
 fn format_date_iso8601(date: &OffsetDateTime) -> String {
