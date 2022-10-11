@@ -471,9 +471,8 @@ fn build_article_list(indices: &[Index]) -> String {
                 .join(&page.metadata.id);
             format!(
                 "<hgroup>\n<h3><a href=\"{path}/\">{title}</a></h3>\n<p><small><time \
-                 datetime=\"{date_iso}\">{date_utc}</time></small></p>\n</hgroup><p>{excerpt}</p>\\
-                 \
-                 n",
+                 datetime=\"{date_iso}\">{date_utc}</time></small></p>\n</hgroup>\n<p>{excerpt}</\
+                 p>\n",
                 path = path.display(),
                 title = page.metadata.title,
                 date_iso = format_date_iso8601(&page.metadata.date.unwrap()),
