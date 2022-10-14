@@ -106,22 +106,33 @@ impl FromStr for Shortcode {
 /// let shortcode = &input[start..end];
 /// ```
 fn find_shortcode(input: &str) -> Option<(usize, usize)> {
+    let mut search_start_idx = 0;
+
     // Find the first '{' char
     // This is a perf optimization as all shortcodes start with '{'
-    let start = input.find(SHORTCODE_START)?;
+    while let Some(start) = input[search_start_idx..].find(SHORTCODE_START) {
+        // Make start an absolute index
+        let start_abs = search_start_idx + start;
 
-    // Check the next char to determine type and find the end
-    let end = match &input[start..] {
-        s if s.starts_with(TAG_START) => s[TAG_START.len()..]
-            .find(TAG_END)
-            .map(|i| start + i + TAG_START.len() + TAG_END.len()),
-        s if s.starts_with(COMMAND_START) => s[COMMAND_START.len()..]
-            .find(COMMAND_END)
-            .map(|i| start + i + COMMAND_START.len() + COMMAND_END.len()),
-        _ => None,
-    }?;
+        // Check the next char to determine type and find the end if it exists
+        let end_abs = match &input[start_abs..] {
+            s if s.starts_with(TAG_START) => s[TAG_START.len()..]
+                .find(TAG_END)
+                .map(|i| start_abs + i + TAG_START.len() + TAG_END.len()),
+            s if s.starts_with(COMMAND_START) => s[COMMAND_START.len()..]
+                .find(COMMAND_END)
+                .map(|i| start_abs + i + COMMAND_START.len() + COMMAND_END.len()),
+            _ => None,
+        };
 
-    Some((start, end))
+        // Check if we found a valid end
+        match end_abs {
+            Some(end_abs) => return Some((start_abs, end_abs)),
+            None => search_start_idx = start_abs + 1,
+        }
+    }
+
+    None
 }
 
 /// Apply shortcodes to the input template file.
@@ -193,6 +204,23 @@ mod tests {
         let input = "abcd{{ 1234 }}asdf";
         let (start, end) = find_shortcode(input).unwrap();
         assert_eq!((4, 14), (start, end));
+    }
+
+    #[test]
+    fn test_shortcode_after_curly_braces() {
+        let input = "{}{%%}";
+        let (start, end) = find_shortcode(input).unwrap();
+        assert_eq!((2, 6), (start, end));
+
+        let input = "{}hel{lo{% include \"test.html\" %}";
+        let (start, end) = find_shortcode(input).unwrap();
+        assert_eq!((8, 33), (start, end));
+    }
+
+    #[test]
+    fn test_shortcode_last() {
+        let input = "test{";
+        assert!(find_shortcode(input).is_none());
     }
 
     #[test]
