@@ -1,5 +1,6 @@
 use std::{
     ffi::OsStr,
+    fmt::Write,
     path::{Path, PathBuf},
 };
 
@@ -473,12 +474,13 @@ fn build_article_list(indices: &[Index]) -> String {
         .filter(|page| {
             page.metadata.date.is_some() && page.metadata.excerpt.is_some() && !page.metadata.draft
         })
-        .map(|page| {
+        .fold(String::new(), |mut output, page| {
             // Append current metadata as HTML to post TOC
             let path = PathBuf::from("/")
                 .join(page.metadata.filepath.parent().unwrap())
                 .join(&page.metadata.id);
-            format!(
+            let _ = write!(
+                output,
                 "<hgroup>\n<h3><a href=\"{path}/\">{title}</a></h3>\n<p><small><time \
                  datetime=\"{date_iso}\">{date_utc}</time></small></p>\n</hgroup>\n<p>{excerpt}</\
                  p>\n",
@@ -487,9 +489,9 @@ fn build_article_list(indices: &[Index]) -> String {
                 date_iso = format_date_iso8601(&page.metadata.date.unwrap()),
                 date_utc = format_date_utc(&page.metadata.date.unwrap()),
                 excerpt = page.metadata.excerpt.as_ref().unwrap(),
-            )
+            );
+            output
         })
-        .collect()
 }
 
 fn format_date_iso8601(date: &OffsetDateTime) -> String {
