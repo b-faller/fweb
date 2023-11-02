@@ -95,6 +95,12 @@ struct PageMetadata {
     /// This path is relative to `templates/`
     #[serde(default = "default_page_template")]
     template: PathBuf,
+
+    /// Whether the page is a draft.
+    ///
+    /// If this is set, only a site build with the draft option enabled will output this page.
+    #[serde(default)]
+    draft: bool,
 }
 
 fn default_page_template() -> PathBuf {
@@ -365,7 +371,8 @@ async fn export_indices_to_html(
 
         // Export pages
         let mut handles = Vec::new();
-        for page in index.pages {
+        let pages = index.pages.into_iter().filter(|page| !page.metadata.draft);
+        for page in pages {
             let config = config.clone();
             let mut ctx = ctx.clone();
             let templates_dir = templates_dir.clone();
@@ -463,7 +470,9 @@ fn build_article_list(indices: &[Index]) -> String {
     indices
         .iter()
         .flat_map(|index| &index.pages)
-        .filter(|page| page.metadata.date.is_some() && page.metadata.excerpt.is_some())
+        .filter(|page| {
+            page.metadata.date.is_some() && page.metadata.excerpt.is_some() && !page.metadata.draft
+        })
         .map(|page| {
             // Append current metadata as HTML to post TOC
             let path = PathBuf::from("/")
