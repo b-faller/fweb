@@ -571,11 +571,14 @@ fn convert_markdown(markdown: &str) -> String {
 }
 
 /// Read and parse site config
-async fn read_site_config(path: impl AsRef<Path>) -> std::io::Result<Config> {
+async fn read_site_config(path: impl AsRef<Path>) -> Result<Config> {
     // Read and parse config.
     let path = path.as_ref();
-    let content = tokio::fs::read_to_string(path).await?;
-    let mut config: Config = toml::from_str(&content)?;
+    let content = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| Error::ConfigRead(path.into(), e))?;
+    let mut config: Config =
+        toml::from_str(&content).map_err(|e| Error::ConfigParse(path.into(), e))?;
 
     // Make config paths relative to the configuration file.
     let basedir = path
@@ -596,9 +599,7 @@ async fn try_main() -> Result<()> {
             .nth(1)
             .unwrap_or_else(|| "config.toml".into()),
     );
-    let config = read_site_config(&config_path)
-        .await
-        .map_err(|e| Error::ConfigRead(config_path, e))?;
+    let config = read_site_config(&config_path).await?;
 
     info!("Config read at {:?}", it.elapsed());
 

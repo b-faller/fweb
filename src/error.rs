@@ -4,6 +4,9 @@ use thiserror::Error as ErrorTrait;
 
 #[derive(Debug, ErrorTrait)]
 pub enum Error {
+    #[error("Parsing config file {0} failed: {1}")]
+    ConfigParse(PathBuf, toml::de::Error),
+
     #[error("Reading config file {0} failed: {1}")]
     ConfigRead(PathBuf, std::io::Error),
 
