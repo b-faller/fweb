@@ -245,11 +245,9 @@ mod tests {
     async fn test_nonexistant_tag() {
         let input = "{{ test }}";
         let shortcode: Shortcode = input.parse().unwrap();
-        assert!(
-            shortcode
-                .to_html(&dummy_config(), &Context::new())
-                .await
-                .is_err()
-        );
+        assert!(shortcode
+            .to_html(&dummy_config(), &Context::new())
+            .await
+            .is_err());
     }
 }
