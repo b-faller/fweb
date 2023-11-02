@@ -4,8 +4,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use clap::Parser;
 use log::{debug, error, info};
-use pulldown_cmark::{Options, Parser};
+use pulldown_cmark::Options;
 use serde::Deserialize;
 use template::Context;
 use time::{
@@ -40,6 +41,18 @@ const DATE_ISO_CONFIG: EncodedConfig = iso8601::Config::DEFAULT
         decimal_digits: None,
     })
     .encode();
+
+/// Command line options.
+#[derive(Debug, clap::Parser)]
+#[command(author, version, about, long_about = None)]
+pub struct Cli {
+    /// Path to the site config.
+    #[arg(default_value = "config.toml", value_hint = clap::ValueHint::FilePath)]
+    pub config_path: PathBuf,
+    /// Build draft pages.
+    #[arg(long, default_value_t = false)]
+    pub drafts: bool,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -222,7 +235,7 @@ impl Website {
     }
 
     /// Build the website to HTML content.
-    async fn build(self) -> Result<()> {
+    async fn build(self, opts: &Cli) -> Result<()> {
         // Copy all assets
         let from = self.config.content_path.join("assets");
         let to = self.config.output_path.clone();
@@ -235,14 +248,14 @@ impl Website {
         // Fill templating context
         let mut ctx = template::Context::new();
         ctx.insert("nav", build_navigation(&indices));
-        ctx.insert("articles", build_article_list(&indices));
+        ctx.insert("articles", build_article_list(&indices, opts));
         ctx.insert("site_title", self.config.site_info.title.to_string());
         ctx.insert(
             "site_description",
             self.config.site_info.description.to_string(),
         );
 
-        export_indices_to_html(&self.config, ctx, indices).await?;
+        export_indices_to_html(&self.config, opts, ctx, indices).await?;
 
         mirror_assets_handle.await.map_err(Error::Join)??;
 
@@ -334,6 +347,7 @@ async fn load_and_parse_content(content_dir: PathBuf) -> Result<Vec<Index>> {
 /// Write all indices to disk.
 async fn export_indices_to_html(
     config: &Config,
+    opts: &Cli,
     mut ctx: Context,
     indices: Vec<Index>,
 ) -> Result<()> {
@@ -372,7 +386,10 @@ async fn export_indices_to_html(
 
         // Export pages
         let mut handles = Vec::new();
-        let pages = index.pages.into_iter().filter(|page| !page.metadata.draft);
+        let pages = index
+            .pages
+            .into_iter()
+            .filter(|page| !page.metadata.draft || opts.drafts);
         for page in pages {
             let config = config.clone();
             let mut ctx = ctx.clone();
@@ -467,12 +484,14 @@ fn build_navigation(indices: &[Index]) -> String {
 }
 
 /// Build an HTML list of articles.
-fn build_article_list(indices: &[Index]) -> String {
+fn build_article_list(indices: &[Index], opts: &Cli) -> String {
     indices
         .iter()
         .flat_map(|index| &index.pages)
         .filter(|page| {
-            page.metadata.date.is_some() && page.metadata.excerpt.is_some() && !page.metadata.draft
+            page.metadata.date.is_some()
+                && page.metadata.excerpt.is_some()
+                && (!page.metadata.draft || opts.drafts)
         })
         .fold(String::new(), |mut output, page| {
             // Append current metadata as HTML to post TOC
@@ -563,7 +582,7 @@ fn convert_markdown(markdown: &str) -> String {
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_TASKLISTS);
-    let parser = Parser::new_ext(markdown, options);
+    let parser = pulldown_cmark::Parser::new_ext(markdown, options);
 
     // Write to String buffer.
     let mut html = String::new();
@@ -572,41 +591,16 @@ fn convert_markdown(markdown: &str) -> String {
     html
 }
 
-/// Read and parse site config
-async fn read_site_config(path: impl AsRef<Path>) -> Result<Config> {
-    // Read and parse config.
-    let path = path.as_ref();
-    let content = tokio::fs::read_to_string(path)
-        .await
-        .map_err(|e| Error::ConfigRead(path.into(), e))?;
-    let mut config: Config =
-        toml::from_str(&content).map_err(|e| Error::ConfigParse(path.into(), e))?;
-
-    // Make config paths relative to the configuration file.
-    let basedir = path
-        .parent()
-        .expect("file does exist and must have a parent");
-    config.content_path = basedir.join(&config.content_path);
-    config.output_path = basedir.join(&config.output_path);
-
-    Ok(config)
-}
-
 async fn try_main() -> Result<()> {
     let it = std::time::Instant::now();
 
-    // Get website config
-    let config_path = PathBuf::from(
-        std::env::args()
-            .nth(1)
-            .unwrap_or_else(|| "config.toml".into()),
-    );
-    let config = read_site_config(&config_path).await?;
+    let cli = Cli::parse();
+    let config = Config::from_file(&cli.config_path).await?;
 
     info!("Config read at {:?}", it.elapsed());
 
     // Build website.
-    Website::new(config).build().await?;
+    Website::new(config).build(&cli).await?;
 
     info!("Website built at {:?}", it.elapsed());
 
