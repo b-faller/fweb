@@ -243,7 +243,10 @@ impl Website {
         // Remove output directory
         tokio::fs::remove_dir_all(&to)
             .await
-            .map_err(|e| Error::OutputPathClean(to.to_path_buf(), e))?;
+            .or_else(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(Error::OutputPathClean(to.to_path_buf(), e)),
+            })?;
 
         // Copy all assets
         let mirror_assets_handle = tokio::spawn(async move { mirror_assets(from, to).await });
