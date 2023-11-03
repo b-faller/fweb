@@ -239,6 +239,13 @@ impl Website {
         // Copy all assets
         let from = self.config.content_path.join("assets");
         let to = self.config.output_path.clone();
+
+        // Remove output directory
+        tokio::fs::remove_dir_all(&to)
+            .await
+            .map_err(|e| Error::OutputPathClean(to.to_path_buf(), e))?;
+
+        // Copy all assets
         let mirror_assets_handle = tokio::spawn(async move { mirror_assets(from, to).await });
 
         // Read and parse content

@@ -4,6 +4,9 @@ use thiserror::Error as ErrorTrait;
 
 #[derive(Debug, ErrorTrait)]
 pub enum Error {
+    #[error("Cleaning output directory {0} failed: {1}")]
+    OutputPathClean(PathBuf, std::io::Error),
+
     #[error("Parsing config file {0} failed: {1}")]
     ConfigParse(PathBuf, toml::de::Error),
 
