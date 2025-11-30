@@ -7,11 +7,11 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-env_logger = { version = "0.10", default-features = false, features = ["auto-color", "humantime"] }
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 log = "0.4"
-pulldown-cmark = { version = "0.9", default-features = false, features = ["simd"] }
+pulldown-cmark = { version = "0.13", default-features = false, features = [ "html", "simd"] }
 serde = { version = "1", default-features = false, features = ["derive"] }
-thiserror = "1"
+thiserror = "2"
 time = { version = "0.3", default-features = false, features = ["serde-well-known", "formatting", "macros"] }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "fs", "io-std"] }
-toml = "0.8"
+toml = "0.9"
