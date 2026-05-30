@@ -1,7 +1,9 @@
 use std::{
     ffi::OsStr,
+    fmt,
     fmt::Write,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use clap::Parser;
@@ -26,7 +28,7 @@ mod error;
 mod template;
 
 use crate::{
-    config::Config,
+    config::{Config, SiteInfo},
     error::{Error, Result},
 };
 
@@ -67,13 +69,33 @@ enum SortOrder {
     Weight,
 }
 
+/// Open Graph content type.
+#[derive(Debug, Clone)]
+enum OgType {
+    Article,
+    Website,
+}
+
+impl fmt::Display for OgType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            OgType::Article => "article",
+            OgType::Website => "website",
+        })
+    }
+}
+
+/// Frontmatter parsed directly from a page's TOML header.
 #[derive(Debug, Clone, Deserialize)]
-struct PageMetadata {
+struct PageFrontmatter {
     /// ID used for URLs.
     id: String,
 
     /// Post title.
     title: String,
+
+    /// Description of the page.
+    description: Option<String>,
 
     /// If the page should be shown in the navigation.
     ///
@@ -97,12 +119,6 @@ struct PageMetadata {
     #[serde(default)]
     #[serde(deserialize_with = "optional_datetime")]
     date: Option<OffsetDateTime>,
-
-    /// The path to the markdown input file.
-    ///
-    /// This path is relative to the `content/`
-    #[serde(skip_deserializing)]
-    filepath: PathBuf,
 
     /// Template file to use.
     ///
@@ -132,36 +148,76 @@ where
     Ok(wrapper.map(|Wrapper(external)| external))
 }
 
+/// Full metadata for a page.
+///
+/// This includes the parsed frontmatter and computed fields.
+#[derive(Debug, Clone)]
+struct PageMetadata {
+    frontmatter: PageFrontmatter,
+    /// The path to the markdown input file, relative to `content/`.
+    filepath: PathBuf,
+    canonical_url: String,
+    og_type: OgType,
+}
+
+impl PageMetadata {
+    fn new(frontmatter: PageFrontmatter, filepath: PathBuf, base_url: &str) -> Self {
+        let url_path = PathBuf::from("/")
+            .join(filepath.parent().unwrap())
+            .join(&frontmatter.id);
+        let canonical_url = format!("{}{}/", base_url, url_path.display());
+        let og_type = if frontmatter.date.is_some() {
+            OgType::Article
+        } else {
+            OgType::Website
+        };
+        Self {
+            frontmatter,
+            filepath,
+            canonical_url,
+            og_type,
+        }
+    }
+}
+
 /// A page is an HTML file within a folder.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 struct Page {
     metadata: PageMetadata,
     html: String,
 }
 
 impl Page {
-    async fn parse_md(content_dir: impl AsRef<Path>, relpath: impl AsRef<Path>) -> Result<Self> {
+    async fn parse_md(
+        content_dir: impl AsRef<Path>,
+        relpath: impl AsRef<Path>,
+        config: Arc<Config>,
+    ) -> Result<Self> {
         let file = content_dir.as_ref().join(&relpath);
         let content = tokio::fs::read_to_string(&file)
             .await
             .map_err(|e| Error::ReadInput(relpath.as_ref().to_path_buf(), e))?;
 
-        let (frontmatter, markdown) = parse_file(&content, file)?;
-        let mut metadata: PageMetadata = toml::from_str(frontmatter)
+        let (frontmatter_str, markdown) = parse_file(&content, file)?;
+        let frontmatter: PageFrontmatter = toml::from_str(frontmatter_str)
             .map_err(|e| Error::ParseMetadata(relpath.as_ref().to_path_buf(), e))?;
-        metadata.filepath = relpath.as_ref().to_path_buf();
+        let filepath = relpath.as_ref().to_path_buf();
 
         Ok(Self {
-            metadata,
+            metadata: PageMetadata::new(frontmatter, filepath, &config.site_info.base_url),
             html: convert_markdown(markdown),
         })
     }
 }
 
+/// Frontmatter parsed directly from an index's TOML header.
 #[derive(Debug, Clone, Deserialize)]
-struct IndexMetadata {
+struct IndexFrontmatter {
     /// Page title.
     title: String,
+
+    /// Page description.
+    description: Option<String>,
 
     /// If the index should be shown in the navigation.
     ///
@@ -179,19 +235,40 @@ struct IndexMetadata {
     /// This path is relative to `templates/`
     #[serde(default = "default_index_template")]
     template: PathBuf,
-
-    /// The path to the markdown input file.
-    ///
-    /// This path is relative to `content/`
-    #[serde(skip_deserializing)]
-    filepath: PathBuf,
 }
 
 fn default_index_template() -> PathBuf {
     "index.html".into()
 }
 
-/// An index is the `_index.html` within a folder in the content.
+#[derive(Debug, Clone)]
+struct IndexMetadata {
+    frontmatter: IndexFrontmatter,
+    /// The path to the markdown input file.
+    ///
+    /// This path is relative to `content/`
+    filepath: PathBuf,
+    canonical_url: String,
+}
+
+impl IndexMetadata {
+    fn new(frontmatter: IndexFrontmatter, filepath: PathBuf, site: &SiteInfo) -> Self {
+        let parent = filepath.parent().expect("index always has a parent");
+        let canonical_url = if parent == Path::new("") {
+            format!("{}/", site.base_url)
+        } else {
+            let url_path = PathBuf::from("/").join(parent);
+            format!("{}{}/", site.base_url, url_path.display())
+        };
+        Self {
+            frontmatter,
+            filepath,
+            canonical_url,
+        }
+    }
+}
+
+/// An index is the `_index.md` within a folder in the content.
 #[derive(Debug, Clone)]
 struct Index {
     metadata: IndexMetadata,
@@ -203,19 +280,26 @@ impl Index {
     /// Reads and parses an input markdown file.
     ///
     /// Note: This does not read in any pages
-    async fn parse_md(content_dir: impl AsRef<Path>, relpath: impl AsRef<Path>) -> Result<Self> {
+    async fn parse_md(
+        content_dir: impl AsRef<Path>,
+        relpath: impl AsRef<Path>,
+        config: Arc<Config>,
+    ) -> Result<Self> {
         let file = content_dir.as_ref().join(&relpath);
         let content = tokio::fs::read_to_string(&file)
             .await
             .map_err(|e| Error::ReadInput(relpath.as_ref().to_path_buf(), e))?;
 
-        let (frontmatter, markdown) = parse_file(&content, file)?;
-        let mut metadata: IndexMetadata = toml::from_str(frontmatter)
+        let (frontmatter_str, markdown) = parse_file(&content, file)?;
+        let frontmatter: IndexFrontmatter = toml::from_str(frontmatter_str)
             .map_err(|e| Error::ParseMetadata(relpath.as_ref().to_path_buf(), e))?;
-        metadata.filepath = relpath.as_ref().to_path_buf();
 
         Ok(Self {
-            metadata,
+            metadata: IndexMetadata::new(
+                frontmatter,
+                relpath.as_ref().to_path_buf(),
+                &config.site_info,
+            ),
             html: convert_markdown(markdown),
             pages: Vec::new(),
         })
@@ -225,13 +309,15 @@ impl Index {
 #[derive(Debug)]
 struct Website {
     /// Configuration for this website.
-    config: Config,
+    config: Arc<Config>,
 }
 
 impl Website {
     /// Create a new website.
     fn new(config: Config) -> Self {
-        Website { config }
+        Website {
+            config: Arc::new(config),
+        }
     }
 
     /// Build the website to HTML content.
@@ -253,7 +339,7 @@ impl Website {
 
         // Read and parse content
         let content_dir = self.config.content_path.join("content");
-        let indices = load_and_parse_content(content_dir).await?;
+        let indices = load_and_parse_content(content_dir, Arc::clone(&self.config)).await?;
 
         // Fill templating context
         let mut ctx = template::Context::new();
@@ -265,7 +351,7 @@ impl Website {
             self.config.site_info.description.to_string(),
         );
 
-        export_indices_to_html(&self.config, opts, ctx, indices).await?;
+        export_indices_to_html(Arc::clone(&self.config), opts, ctx, indices).await?;
 
         mirror_assets_handle.await.map_err(Error::Join)??;
 
@@ -276,7 +362,7 @@ impl Website {
 /// Loads and parses all content in the `content_dir`.
 ///
 /// Returns the base index which contains all further pages.
-async fn load_and_parse_content(content_dir: PathBuf) -> Result<Vec<Index>> {
+async fn load_and_parse_content(content_dir: PathBuf, config: Arc<Config>) -> Result<Vec<Index>> {
     // Discovered indices
     let mut indices = Vec::new();
     // Stack storing the directories which remain to be processed
@@ -307,8 +393,9 @@ async fn load_and_parse_content(content_dir: PathBuf) -> Result<Vec<Index>> {
                         .strip_prefix(&content_dir)
                         .expect("starts with content directory")
                         .to_path_buf();
+                    let config = Arc::clone(&config);
                     pages_handles.push(tokio::spawn(async move {
-                        Page::parse_md(content_dir, relpath).await
+                        Page::parse_md(content_dir, relpath, config).await
                     }));
                 }
             }
@@ -327,8 +414,9 @@ async fn load_and_parse_content(content_dir: PathBuf) -> Result<Vec<Index>> {
                 .expect("starts with content directory")
                 .to_path_buf();
 
+            let config = Arc::clone(&config);
             let mut index =
-                tokio::spawn(async move { Index::parse_md(content_dir, relpath).await })
+                tokio::spawn(async move { Index::parse_md(content_dir, relpath, config).await })
                     .await
                     .map_err(Error::Join)??;
             index.pages = pages;
@@ -337,13 +425,24 @@ async fn load_and_parse_content(content_dir: PathBuf) -> Result<Vec<Index>> {
             // We use unstable here since _I suppose_ pages are already in arbitrary order
             // coming from the async tasks.
             index.pages.sort_unstable_by(|p1, p2| {
-                match index.metadata.sort_by {
-                    SortOrder::Title => p1.metadata.title.cmp(&p2.metadata.title),
+                match index.metadata.frontmatter.sort_by {
+                    SortOrder::Title => p1
+                        .metadata
+                        .frontmatter
+                        .title
+                        .cmp(&p2.metadata.frontmatter.title),
                     SortOrder::Date => {
                         // Sort pages based on their date descending.
-                        p2.metadata.date.cmp(&p1.metadata.date)
+                        p2.metadata
+                            .frontmatter
+                            .date
+                            .cmp(&p1.metadata.frontmatter.date)
                     }
-                    SortOrder::Weight => p1.metadata.weight.cmp(&p2.metadata.weight),
+                    SortOrder::Weight => p1
+                        .metadata
+                        .frontmatter
+                        .weight
+                        .cmp(&p2.metadata.frontmatter.weight),
                 }
             });
 
@@ -356,7 +455,7 @@ async fn load_and_parse_content(content_dir: PathBuf) -> Result<Vec<Index>> {
 
 /// Write all indices to disk.
 async fn export_indices_to_html(
-    config: &Config,
+    config: Arc<Config>,
     opts: &Cli,
     mut ctx: Context,
     indices: Vec<Index>,
@@ -378,16 +477,26 @@ async fn export_indices_to_html(
             .map_err(|e| Error::CreateDirectory(dir, e))?;
 
         // Build index context
-        ctx.insert("title", index.metadata.title.to_string());
+        ctx.insert("title", index.metadata.frontmatter.title.to_string());
         ctx.insert("content", index.html.to_string());
+        ctx.insert("canonical_url", index.metadata.canonical_url.to_string());
+        ctx.insert("og_type", OgType::Website.to_string());
+        ctx.insert(
+            "description",
+            index
+                .metadata
+                .frontmatter
+                .description
+                .unwrap_or(config.site_info.description.to_string()),
+        );
 
         // Apply templating
         let templates_dir = config.content_path.join("templates");
-        let template_path = templates_dir.join(&index.metadata.template);
+        let template_path = templates_dir.join(&index.metadata.frontmatter.template);
         let template = tokio::fs::read_to_string(&template_path)
             .await
             .map_err(|e| Error::ReadInput(template_path, e))?;
-        let html = template::template(config, &ctx, template).await?;
+        let html = template::template(&config, &ctx, template).await?;
 
         // Write index.html
         tokio::fs::write(&file, html)
@@ -399,9 +508,9 @@ async fn export_indices_to_html(
         let pages = index
             .pages
             .into_iter()
-            .filter(|page| !page.metadata.draft || opts.drafts);
+            .filter(|page| !page.metadata.frontmatter.draft || opts.drafts);
         for page in pages {
-            let config = config.clone();
+            let config = Arc::clone(&config);
             let mut ctx = ctx.clone();
             let templates_dir = templates_dir.clone();
 
@@ -410,17 +519,29 @@ async fn export_indices_to_html(
 
                 // Build page context
                 ctx.insert("content", page.html.to_string());
-                ctx.insert("title", page.metadata.title.to_string());
-                if let Some(excerpt) = page.metadata.excerpt {
+                ctx.insert("title", page.metadata.frontmatter.title.to_string());
+                ctx.insert("canonical_url", page.metadata.canonical_url.clone());
+                ctx.insert("og_type", page.metadata.og_type.to_string());
+                ctx.insert(
+                    "description",
+                    page.metadata
+                        .frontmatter
+                        .description
+                        .as_deref()
+                        .or(page.metadata.frontmatter.excerpt.as_deref())
+                        .unwrap_or(&config.site_info.description)
+                        .to_string(),
+                );
+                if let Some(excerpt) = page.metadata.frontmatter.excerpt {
                     ctx.insert("excerpt", excerpt);
                 }
-                if let Some(date) = page.metadata.date {
+                if let Some(date) = page.metadata.frontmatter.date {
                     ctx.insert("date_iso8601", format_date_iso8601(&date));
                     ctx.insert("date", format_date_utc(&date));
                 }
 
                 // Apply templating
-                let template_path = templates_dir.join(&page.metadata.template);
+                let template_path = templates_dir.join(&page.metadata.frontmatter.template);
                 let template = tokio::fs::read_to_string(&template_path)
                     .await
                     .map_err(|e| Error::ReadInput(template_path, e))?;
@@ -430,7 +551,7 @@ async fn export_indices_to_html(
                 let dir = config
                     .output_path
                     .join(page.metadata.filepath.parent().unwrap())
-                    .join(page.metadata.id);
+                    .join(page.metadata.frontmatter.id);
                 tokio::fs::create_dir_all(dir.clone())
                     .await
                     .map_err(|e| Error::CreateDirectory(dir.clone(), e))?;
@@ -456,7 +577,13 @@ fn build_navigation(indices: &[Index]) -> String {
 
     indices
         .iter()
-        .flat_map(|index| index.metadata.display_in_nav.map(|i| (i, index)))
+        .flat_map(|index| {
+            index
+                .metadata
+                .frontmatter
+                .display_in_nav
+                .map(|i| (i, index))
+        })
         .for_each(|(i, index)| {
             let path = PathBuf::from("/")
                 .join(index.metadata.filepath.parent().unwrap())
@@ -465,25 +592,31 @@ fn build_navigation(indices: &[Index]) -> String {
             if path.len() > 1 {
                 navs.push((
                     i,
-                    format!("<a href=\"{}/\">{}</a>\n", path, index.metadata.title),
+                    format!(
+                        "<a href=\"{}/\">{}</a>\n",
+                        path, index.metadata.frontmatter.title
+                    ),
                 ));
             } else {
-                navs.push((i, format!("<a href=\"/\">{}</a>\n", index.metadata.title)));
+                navs.push((
+                    i,
+                    format!("<a href=\"/\">{}</a>\n", index.metadata.frontmatter.title),
+                ));
             }
             index
                 .pages
                 .iter()
-                .flat_map(|page| page.metadata.display_in_nav.map(|i| (i, page)))
+                .flat_map(|page| page.metadata.frontmatter.display_in_nav.map(|i| (i, page)))
                 .for_each(|(i, page)| {
                     let path = PathBuf::from("/")
                         .join(index.metadata.filepath.parent().unwrap())
-                        .join(&page.metadata.id);
+                        .join(&page.metadata.frontmatter.id);
                     navs.push((
                         i,
                         format!(
                             "<a href=\"{}/\">{}</a>\n",
                             path.display(),
-                            page.metadata.title
+                            page.metadata.frontmatter.title
                         ),
                     ));
                 });
@@ -499,25 +632,25 @@ fn build_article_list(indices: &[Index], opts: &Cli) -> String {
         .iter()
         .flat_map(|index| &index.pages)
         .filter(|page| {
-            page.metadata.date.is_some()
-                && page.metadata.excerpt.is_some()
-                && (!page.metadata.draft || opts.drafts)
+            page.metadata.frontmatter.date.is_some()
+                && page.metadata.frontmatter.excerpt.is_some()
+                && (!page.metadata.frontmatter.draft || opts.drafts)
         })
         .fold(String::new(), |mut output, page| {
             // Append current metadata as HTML to post TOC
             let path = PathBuf::from("/")
                 .join(page.metadata.filepath.parent().unwrap())
-                .join(&page.metadata.id);
+                .join(&page.metadata.frontmatter.id);
             let _ = write!(
                 output,
                 "<hgroup>\n<h3><a href=\"{path}/\">{title}</a></h3>\n<p><small><time \
                  datetime=\"{date_iso}\">{date_utc}</time></small></p>\n</hgroup>\n<p>{excerpt}</\
                  p>\n",
                 path = path.display(),
-                title = page.metadata.title,
-                date_iso = format_date_iso8601(&page.metadata.date.unwrap()),
-                date_utc = format_date_utc(&page.metadata.date.unwrap()),
-                excerpt = page.metadata.excerpt.as_ref().unwrap(),
+                title = page.metadata.frontmatter.title,
+                date_iso = format_date_iso8601(&page.metadata.frontmatter.date.unwrap()),
+                date_utc = format_date_utc(&page.metadata.frontmatter.date.unwrap()),
+                excerpt = page.metadata.frontmatter.excerpt.as_ref().unwrap(),
             );
             output
         })

@@ -11,6 +11,8 @@ pub struct SiteInfo {
     pub title: String,
     /// Short site description.
     pub description: String,
+    /// Canonical base URL (no trailing slash), e.g. `https://example.com`.
+    pub base_url: String,
 }
 
 /// Generation configuration and global information.

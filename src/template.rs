@@ -166,6 +166,7 @@ mod tests {
             site_info: config::SiteInfo {
                 title: "".to_string(),
                 description: "".to_string(),
+                base_url: "".to_string(),
             },
             content_path: "".into(),
             output_path: "".into(),
