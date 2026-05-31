@@ -340,80 +340,92 @@ impl Website {
 
     /// Build the website to HTML content.
     async fn build(self, opts: &Cli) -> Result<()> {
-        // Copy all assets
-        let from = self.config.content_path.join("assets");
-        let to = self.config.output_path.clone();
+        self.clean_output_dir().await?;
 
-        // Remove output directory
+        let mirror_handle = self.spawn_asset_mirror();
+        let indices = self.load_indices().await?;
+
+        let base_ctx = self.base_context(&indices);
+        let robots_handle = self.spawn_render_to_output(&base_ctx, "robots.txt");
+        let sitemap_handle = self.spawn_render_to_output(&base_ctx, "sitemap.xml");
+        render_and_write_html(Arc::clone(&self.config), opts, base_ctx, indices).await?;
+
+        mirror_handle.await.map_err(Error::Join)??;
+        robots_handle.await.map_err(Error::Join)??;
+        sitemap_handle.await.map_err(Error::Join)??;
+
+        Ok(())
+    }
+
+    /// Remove the output directory.
+    async fn clean_output_dir(&self) -> Result<()> {
+        let to = self.config.output_path.clone();
         tokio::fs::remove_dir_all(&to)
             .await
             .or_else(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => Ok(()),
-                _ => Err(Error::OutputPathClean(to.to_path_buf(), e)),
-            })?;
+                _ => Err(Error::OutputPathClean(to, e)),
+            })
+    }
 
-        // Copy all assets
-        let mirror_assets_handle = tokio::spawn(async move { mirror_assets(from, to).await });
+    /// Mirror the `assets` directory into the output directory concurrently.
+    fn spawn_asset_mirror(&self) -> tokio::task::JoinHandle<Result<()>> {
+        let from = self.config.content_path.join("assets");
+        let to = self.config.output_path.clone();
+        tokio::spawn(async move { mirror_assets(from, to).await })
+    }
 
-        // Read and parse content
+    /// Load and parse the `content` directory.
+    async fn load_indices(&self) -> Result<Vec<Index>> {
         let content_dir = self.config.content_path.join("content");
         let mut indices = load_and_parse_content(content_dir, Arc::clone(&self.config)).await?;
         populate_breadcrumbs(&mut indices);
+        Ok(indices)
+    }
 
-        // Fill base templating context
-        let mut base_ctx = Context::new();
-        base_ctx.insert(
+    /// Build the base templating context shared by every rendered file.
+    fn base_context(&self, indices: &[Index]) -> Context {
+        let mut ctx = Context::new();
+        ctx.insert(
             "site_title".to_string(),
             self.config.site_info.title.to_string().into(),
         );
-        base_ctx.insert(
+        ctx.insert(
             "site_description".to_string(),
             self.config.site_info.description.to_string().into(),
         );
-        base_ctx.insert(
+        ctx.insert(
             "site_base_url".to_string(),
             self.config.site_info.base_url.to_string().into(),
         );
-        base_ctx.insert("indices".to_string(), build_indices_list(&indices));
-        base_ctx.insert("nav".to_string(), build_nav_list(&indices));
+        ctx.insert("indices".to_string(), build_indices_list(indices));
+        ctx.insert("nav".to_string(), build_nav_list(indices));
+        ctx
+    }
 
-        debug!("Templating robots.txt");
-        let robots_template_path = self
-            .config
-            .content_path
-            .join("templates")
-            .join("robots.txt");
-        let robots_template = tokio::fs::read_to_string(&robots_template_path)
-            .await
-            .map_err(|e| Error::ReadInput(robots_template_path.clone(), e))?;
-        let robots_txt =
-            template::template(&self.config, base_ctx.clone(), robots_template).await?;
-        let robots_txt_out = self.config.output_path.join("robots.txt");
-        tokio::fs::write(&robots_txt_out, robots_txt)
-            .await
-            .map_err(|e| Error::WriteFile(robots_template_path, e))?;
-
-        debug!("Templating sitemap.xml");
-        let sitemap_template_path = self
-            .config
-            .content_path
-            .join("templates")
-            .join("sitemap.xml");
-        let sitemap_template = tokio::fs::read_to_string(&sitemap_template_path)
-            .await
-            .map_err(|e| Error::ReadInput(sitemap_template_path, e))?;
-        let sitemap_xml =
-            template::template(&self.config, base_ctx.clone(), sitemap_template).await?;
-        let sitemap_out = self.config.output_path.join("sitemap.xml");
-        tokio::fs::write(&sitemap_out, sitemap_xml)
-            .await
-            .map_err(|e| Error::WriteFile(sitemap_out, e))?;
-
-        export_indices_to_html(Arc::clone(&self.config), opts, base_ctx, indices).await?;
-
-        mirror_assets_handle.await.map_err(Error::Join)??;
-
-        Ok(())
+    /// Render a top-level template (e.g. `robots.txt`, `sitemap.xml`) to the output
+    /// directory concurrently.
+    fn spawn_render_to_output(
+        &self,
+        base_ctx: &Context,
+        name: &str,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        let config = Arc::clone(&self.config);
+        let ctx = base_ctx.clone();
+        let name = name.to_string();
+        tokio::spawn(async move {
+            debug!("Templating {name}");
+            let template_path = config.content_path.join("templates").join(&name);
+            let template = tokio::fs::read_to_string(&template_path)
+                .await
+                .map_err(|e| Error::ReadInput(template_path, e))?;
+            let rendered = template::template(&config, ctx, template).await?;
+            let out = config.output_path.join(&name);
+            tokio::fs::write(&out, rendered)
+                .await
+                .map_err(|e| Error::WriteFile(out, e))?;
+            Ok(())
+        })
     }
 }
 
@@ -593,7 +605,7 @@ fn build_breadcrumb_chain(
 }
 
 /// Write all indices to disk.
-async fn export_indices_to_html(
+async fn render_and_write_html(
     config: Arc<Config>,
     opts: &Cli,
     base_ctx: Context,
