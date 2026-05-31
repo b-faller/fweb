@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     ffi::OsStr,
-    fmt::{self, Write},
+    fmt,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -10,7 +10,6 @@ use clap::Parser;
 use log::{debug, error, info};
 use pulldown_cmark::Options;
 use serde::Deserialize;
-use template::Context;
 use time::{
     format_description::{
         well_known::{
@@ -26,13 +25,13 @@ use time::{
 mod config;
 mod error;
 mod json_ld;
-mod sitemap;
 mod template;
 
 use crate::{
     config::{Config, SiteInfo},
     error::{Error, Result},
     json_ld::{Breadcrumb, SchemaType},
+    template::{Context, TemplateValue},
 };
 
 /// Date format used to display dates.
@@ -362,16 +361,23 @@ impl Website {
         populate_breadcrumbs(&mut indices);
 
         // Fill templating context
-        let mut ctx = template::Context::new();
-        ctx.insert("nav", build_navigation(&indices));
-        ctx.insert("articles", build_article_list(&indices, opts));
-        ctx.insert("site_title", self.config.site_info.title.to_string());
+        let mut ctx = Context::new();
         ctx.insert(
-            "site_description",
-            self.config.site_info.description.to_string(),
+            "site_title".to_string(),
+            self.config.site_info.title.to_string().into(),
         );
-        ctx.insert("site_base_url", self.config.site_info.base_url.to_string());
+        ctx.insert(
+            "site_description".to_string(),
+            self.config.site_info.description.to_string().into(),
+        );
+        ctx.insert(
+            "site_base_url".to_string(),
+            self.config.site_info.base_url.to_string().into(),
+        );
+        ctx.insert("indices".to_string(), build_indices_list(&indices));
+        ctx.insert("nav".to_string(), build_nav_list(&indices));
 
+        debug!("Templating robots.txt");
         let robots_template_path = self
             .config
             .content_path
@@ -380,16 +386,26 @@ impl Website {
         let robots_template = tokio::fs::read_to_string(&robots_template_path)
             .await
             .map_err(|e| Error::ReadInput(robots_template_path.clone(), e))?;
-        let robots_txt = template::template(&self.config, &ctx, robots_template).await?;
-        let robots_txt_path = self.config.output_path.join("robots.txt");
-        tokio::fs::write(&robots_txt_path, robots_txt)
+        let robots_txt = template::template(&self.config, ctx.clone(), robots_template).await?;
+        let robots_txt_out = self.config.output_path.join("robots.txt");
+        tokio::fs::write(&robots_txt_out, robots_txt)
             .await
             .map_err(|e| Error::WriteFile(robots_template_path, e))?;
 
-        let sitemap_xml = sitemap::generate(&indices);
-        tokio::fs::write(self.config.output_path.join("sitemap.xml"), sitemap_xml)
+        debug!("Templating sitemap.xml");
+        let sitemap_template_path = self
+            .config
+            .content_path
+            .join("templates")
+            .join("sitemap.xml");
+        let sitemap_template = tokio::fs::read_to_string(&sitemap_template_path)
             .await
-            .map_err(|e| Error::WriteFile(self.config.output_path.join("sitemap.xml"), e))?;
+            .map_err(|e| Error::ReadInput(sitemap_template_path, e))?;
+        let sitemap_xml = template::template(&self.config, ctx.clone(), sitemap_template).await?;
+        let sitemap_out = self.config.output_path.join("sitemap.xml");
+        tokio::fs::write(&sitemap_out, sitemap_xml)
+            .await
+            .map_err(|e| Error::WriteFile(sitemap_out, e))?;
 
         export_indices_to_html(Arc::clone(&self.config), opts, ctx, indices).await?;
 
@@ -504,7 +520,7 @@ fn populate_breadcrumbs(indices: &mut [Index]) {
                 .metadata
                 .filepath
                 .parent()
-                .expect("Each filepath has parent")
+                .expect("Each file has a parent directory")
                 .to_path_buf();
             let breadcrumb = Breadcrumb {
                 name: idx.metadata.frontmatter.title.clone(),
@@ -598,34 +614,40 @@ async fn export_indices_to_html(
             .map_err(|e| Error::CreateDirectory(dir, e))?;
 
         // Build index context
-        ctx.insert("title", index.metadata.frontmatter.title.to_string());
-        ctx.insert("content", index.html.to_string());
-        ctx.insert("canonical_url", index.metadata.canonical_url.to_string());
-        ctx.insert("og_type", OgType::Website.to_string());
+        ctx.insert("pages".to_string(), build_pages_list(&index, opts));
+        ctx.insert("title".to_string(), index.metadata.frontmatter.title.into());
+        ctx.insert("content".to_string(), index.html.into());
         ctx.insert(
-            "description",
+            "canonical_url".to_string(),
+            index.metadata.canonical_url.into(),
+        );
+        ctx.insert("og_type".to_string(), OgType::Website.to_string().into());
+        ctx.insert(
+            "description".to_string(),
             index
                 .metadata
                 .frontmatter
                 .description
-                .unwrap_or(config.site_info.description.to_string()),
+                .unwrap_or(config.site_info.description.to_string())
+                .into(),
         );
         ctx.insert(
-            "schema_jsonld",
-            json_ld::generate(index.metadata.frontmatter.schema, &ctx)?,
+            "schema_jsonld".to_string(),
+            json_ld::generate(index.metadata.frontmatter.schema, &ctx)?.into(),
         );
         ctx.insert(
-            "breadcrumb_jsonld",
-            json_ld::generate_breadcrumbs(&index.metadata.breadcrumbs),
+            "breadcrumb_jsonld".to_string(),
+            json_ld::generate_breadcrumbs(&index.metadata.breadcrumbs).into(),
         );
 
         // Apply templating
         let templates_dir = config.content_path.join("templates");
         let template_path = templates_dir.join(&index.metadata.frontmatter.template);
+        debug!("Templating file {}", template_path.display());
         let template = tokio::fs::read_to_string(&template_path)
             .await
             .map_err(|e| Error::ReadInput(template_path, e))?;
-        let html = template::template(&config, &ctx, template).await?;
+        let html = template::template(&config, ctx.clone(), template).await?;
 
         // Write index.html
         tokio::fs::write(&file, html)
@@ -647,37 +669,47 @@ async fn export_indices_to_html(
                 debug!("Building page '{:?}'", &page.metadata);
 
                 // Build page context
-                ctx.insert("content", page.html.to_string());
-                ctx.insert("title", page.metadata.frontmatter.title.to_string());
-                ctx.insert("canonical_url", page.metadata.canonical_url.clone());
-                ctx.insert("og_type", page.metadata.og_type.to_string());
+                ctx.insert("content".to_string(), page.html.into());
+                ctx.insert("title".to_string(), page.metadata.frontmatter.title.into());
                 ctx.insert(
-                    "description",
+                    "canonical_url".to_string(),
+                    page.metadata.canonical_url.into(),
+                );
+                ctx.insert(
+                    "og_type".to_string(),
+                    page.metadata.og_type.to_string().into(),
+                );
+                ctx.insert(
+                    "description".to_string(),
                     page.metadata
                         .frontmatter
                         .description
                         .as_deref()
                         .or(page.metadata.frontmatter.excerpt.as_deref())
                         .unwrap_or(&config.site_info.description)
-                        .to_string(),
+                        .to_string()
+                        .into(),
                 );
                 if let Some(excerpt) = page.metadata.frontmatter.excerpt {
-                    ctx.insert("excerpt", excerpt);
+                    ctx.insert("excerpt".to_string(), excerpt.into());
                 }
                 if let Some(author) = page.metadata.frontmatter.author {
-                    ctx.insert("author", author);
+                    ctx.insert("author".to_string(), author.into());
                 }
                 if let Some(date) = page.metadata.frontmatter.date {
-                    ctx.insert("date_iso8601", format_date_iso8601(&date));
-                    ctx.insert("date", format_date_utc(&date));
+                    ctx.insert(
+                        "date_iso8601".to_string(),
+                        format_date_iso8601(&date).into(),
+                    );
+                    ctx.insert("date".to_string(), format_date_utc(&date).into());
                 }
                 ctx.insert(
-                    "schema_jsonld",
-                    json_ld::generate(page.metadata.frontmatter.schema, &ctx)?,
+                    "schema_jsonld".to_string(),
+                    json_ld::generate(page.metadata.frontmatter.schema, &ctx)?.into(),
                 );
                 ctx.insert(
-                    "breadcrumb_jsonld",
-                    json_ld::generate_breadcrumbs(&page.metadata.breadcrumbs),
+                    "breadcrumb_jsonld".to_string(),
+                    json_ld::generate_breadcrumbs(&page.metadata.breadcrumbs).into(),
                 );
 
                 // Apply templating
@@ -685,7 +717,7 @@ async fn export_indices_to_html(
                 let template = tokio::fs::read_to_string(&template_path)
                     .await
                     .map_err(|e| Error::ReadInput(template_path, e))?;
-                let html = template::template(&config, &ctx, template).await?;
+                let html = template::template(&config, ctx, template).await?;
 
                 // Write page HTML to file
                 let dir = config
@@ -711,89 +743,119 @@ async fn export_indices_to_html(
     Ok(())
 }
 
-/// Create the HTML for the navigation based on the indices and pages.
-fn build_navigation(indices: &[Index]) -> String {
-    let mut navs = Vec::new();
+/// Build the sorted navigation list from indices and their nav-flagged pages.
+fn build_nav_list(indices: &[Index]) -> TemplateValue {
+    let mut navs: Vec<(usize, Context)> = Vec::new();
 
-    indices
-        .iter()
-        .flat_map(|index| {
-            index
+    for index in indices {
+        if let Some(pos) = index.metadata.frontmatter.display_in_nav {
+            let parent = index
                 .metadata
-                .frontmatter
-                .display_in_nav
-                .map(|i| (i, index))
-        })
-        .for_each(|(i, index)| {
-            let path = PathBuf::from("/")
-                .join(index.metadata.filepath.parent().unwrap())
-                .display()
-                .to_string();
-            if path.len() > 1 {
-                navs.push((
-                    i,
-                    format!(
-                        "<a href=\"{}/\">{}</a>\n",
-                        path, index.metadata.frontmatter.title
-                    ),
-                ));
+                .filepath
+                .parent()
+                .expect("Each file has a parent directory");
+            let url = if parent == Path::new("") {
+                "/".to_string()
             } else {
-                navs.push((
-                    i,
-                    format!("<a href=\"/\">{}</a>\n", index.metadata.frontmatter.title),
-                ));
+                format!("/{}/", parent.display())
+            };
+            let mut item = Context::new();
+            item.insert("url".to_string(), url.into());
+            item.insert(
+                "title".to_string(),
+                index.metadata.frontmatter.title.clone().into(),
+            );
+            navs.push((pos, item));
+        }
+        for page in &index.pages {
+            if let Some(pos) = page.metadata.frontmatter.display_in_nav {
+                let parent = index.metadata.filepath.parent().unwrap();
+                let url = if parent == Path::new("") {
+                    format!("/{}/", page.metadata.frontmatter.id)
+                } else {
+                    format!("/{}/{}/", parent.display(), page.metadata.frontmatter.id)
+                };
+                let mut item = Context::new();
+                item.insert("url".to_string(), url.into());
+                item.insert(
+                    "title".to_string(),
+                    page.metadata.frontmatter.title.clone().into(),
+                );
+                navs.push((pos, item));
             }
-            index
-                .pages
-                .iter()
-                .flat_map(|page| page.metadata.frontmatter.display_in_nav.map(|i| (i, page)))
-                .for_each(|(i, page)| {
-                    let path = PathBuf::from("/")
-                        .join(index.metadata.filepath.parent().unwrap())
-                        .join(&page.metadata.frontmatter.id);
-                    navs.push((
-                        i,
-                        format!(
-                            "<a href=\"{}/\">{}</a>\n",
-                            path.display(),
-                            page.metadata.frontmatter.title
-                        ),
-                    ));
-                });
-        });
+        }
+    }
 
-    navs.sort_by_key(|(i, _nav)| *i);
-    navs.into_iter().map(|(_i, nav)| nav).collect()
+    navs.sort_by_key(|(pos, _)| *pos);
+    TemplateValue::List(navs.into_iter().map(|(_, item)| item).collect())
 }
 
-/// Build an HTML list of articles.
-fn build_article_list(indices: &[Index], opts: &Cli) -> String {
-    indices
+/// Build the pages list for a single index, suitable for template rendering.
+///
+/// Each item carries: `url`, `title`, and optionally `date`, `date_iso8601`, `excerpt`.
+fn build_pages_list(index: &Index, opts: &Cli) -> TemplateValue {
+    let items = index
+        .pages
         .iter()
-        .flat_map(|index| &index.pages)
-        .filter(|page| {
-            page.metadata.frontmatter.date.is_some()
-                && page.metadata.frontmatter.excerpt.is_some()
-                && (!page.metadata.frontmatter.draft || opts.drafts)
-        })
-        .fold(String::new(), |mut output, page| {
-            // Append current metadata as HTML to post TOC
-            let path = PathBuf::from("/")
-                .join(page.metadata.filepath.parent().unwrap())
-                .join(&page.metadata.frontmatter.id);
-            let _ = write!(
-                output,
-                "<hgroup>\n<h3><a href=\"{path}/\">{title}</a></h3>\n<p><small><time \
-                 datetime=\"{date_iso}\">{date_utc}</time></small></p>\n</hgroup>\n<p>{excerpt}</\
-                 p>\n",
-                path = path.display(),
-                title = page.metadata.frontmatter.title,
-                date_iso = format_date_iso8601(&page.metadata.frontmatter.date.unwrap()),
-                date_utc = format_date_utc(&page.metadata.frontmatter.date.unwrap()),
-                excerpt = page.metadata.frontmatter.excerpt.as_ref().unwrap(),
+        .filter(|page| !page.metadata.frontmatter.draft || opts.drafts)
+        .map(|page| {
+            let parent = page.metadata.filepath.parent().unwrap();
+            let url = if parent == Path::new("") {
+                format!("/{}/", page.metadata.frontmatter.id)
+            } else {
+                format!("/{}/{}/", parent.display(), page.metadata.frontmatter.id)
+            };
+            let mut item = Context::new();
+            item.insert("url".to_string(), url.into());
+            item.insert(
+                "title".to_string(),
+                page.metadata.frontmatter.title.clone().into(),
             );
-            output
+            if let Some(ref excerpt) = page.metadata.frontmatter.excerpt {
+                item.insert("excerpt".to_string(), excerpt.clone().into());
+            }
+            if let Some(date) = page.metadata.frontmatter.date {
+                item.insert("date".to_string(), format_date_utc(&date).into());
+                item.insert(
+                    "date_iso8601".to_string(),
+                    format_date_iso8601(&date).into(),
+                );
+            }
+            item
         })
+        .collect();
+    TemplateValue::List(items)
+}
+
+/// Build the full indices list for sitemap rendering.
+///
+/// Each item carries: `url` and `pages` (a nested list with `url` per page).
+fn build_indices_list(indices: &[Index]) -> TemplateValue {
+    let items = indices
+        .iter()
+        .map(|index| {
+            let pages = index
+                .pages
+                .iter()
+                .map(|page| {
+                    let mut item = Context::new();
+                    item.insert(
+                        "url".to_string(),
+                        page.metadata.canonical_url.clone().into(),
+                    );
+                    item
+                })
+                .collect();
+            let mut item = Context::new();
+            item.insert(
+                "url".to_string(),
+                index.metadata.canonical_url.clone().into(),
+            );
+            item.insert("pages".to_string(), TemplateValue::List(pages));
+            item
+        })
+        .collect();
+    TemplateValue::List(items)
 }
 
 fn format_date_iso8601(date: &OffsetDateTime) -> String {
