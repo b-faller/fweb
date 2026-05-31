@@ -564,9 +564,7 @@ mod tests {
         let ctx = make_ctx([("test", "value".into())]);
         assert_eq!(
             "value",
-            template(&dummy_config(), ctx,"{{ test }}")
-                .await
-                .unwrap()
+            template(&dummy_config(), ctx, "{{ test }}").await.unwrap()
         );
     }
 
@@ -580,13 +578,9 @@ mod tests {
     #[tokio::test]
     async fn test_if_truthy() {
         let ctx = make_ctx([("show", "yes".into())]);
-        let out = template(
-            &dummy_config(),
-            ctx,
-            "{% if show %}visible{% endif %}",
-        )
-        .await
-        .unwrap();
+        let out = template(&dummy_config(), ctx, "{% if show %}visible{% endif %}")
+            .await
+            .unwrap();
         assert_eq!("visible", out);
     }
 
@@ -605,20 +599,16 @@ mod tests {
     #[tokio::test]
     async fn test_if_falsy_empty_scalar() {
         let ctx = make_ctx([("show", "".into())]);
-        let out = template(
-            &dummy_config(),
-            ctx,
-            "{% if show %}visible{% endif %}",
-        )
-        .await
-        .unwrap();
+        let out = template(&dummy_config(), ctx, "{% if show %}visible{% endif %}")
+            .await
+            .unwrap();
         assert_eq!("", out);
     }
 
     #[tokio::test]
     async fn test_if_truthy_nonempty_list() {
         let ctx = make_ctx([("items", TemplateValue::List(vec![Context::new()]))]);
-        let out = template(&dummy_config(), ctx,"{% if items %}yes{% endif %}")
+        let out = template(&dummy_config(), ctx, "{% if items %}yes{% endif %}")
             .await
             .unwrap();
         assert_eq!("yes", out);
@@ -627,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn test_if_falsy_empty_list() {
         let ctx = make_ctx([("items", TemplateValue::List(vec![]))]);
-        let out = template(&dummy_config(), ctx,"{% if items %}yes{% endif %}")
+        let out = template(&dummy_config(), ctx, "{% if items %}yes{% endif %}")
             .await
             .unwrap();
         assert_eq!("", out);
@@ -648,13 +638,9 @@ mod tests {
     #[tokio::test]
     async fn test_if_not_present_key() {
         let ctx = make_ctx([("present", "1".into())]);
-        let out = template(
-            &dummy_config(),
-            ctx,
-            "{% if not present %}shown{% endif %}",
-        )
-        .await
-        .unwrap();
+        let out = template(&dummy_config(), ctx, "{% if not present %}shown{% endif %}")
+            .await
+            .unwrap();
         assert_eq!("", out);
     }
 
@@ -735,10 +721,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_for_surrounding_text_preserved() {
-        let items = vec![
-            make_ctx([("x", "1".into())]),
-            make_ctx([("x", "2".into())]),
-        ];
+        let items = vec![make_ctx([("x", "1".into())]), make_ctx([("x", "2".into())])];
         let ctx = make_ctx([("items", TemplateValue::List(items))]);
         let out = template(
             &dummy_config(),
@@ -753,7 +736,7 @@ mod tests {
     #[tokio::test]
     async fn test_for_unterminated_errors() {
         let ctx = make_ctx([("items", TemplateValue::List(vec![]))]);
-        let result = template(&dummy_config(), ctx,"{% for item in items %}body").await;
+        let result = template(&dummy_config(), ctx, "{% for item in items %}body").await;
         assert!(result.is_err());
     }
 

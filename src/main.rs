@@ -360,22 +360,22 @@ impl Website {
         let mut indices = load_and_parse_content(content_dir, Arc::clone(&self.config)).await?;
         populate_breadcrumbs(&mut indices);
 
-        // Fill templating context
-        let mut ctx = Context::new();
-        ctx.insert(
+        // Fill base templating context
+        let mut base_ctx = Context::new();
+        base_ctx.insert(
             "site_title".to_string(),
             self.config.site_info.title.to_string().into(),
         );
-        ctx.insert(
+        base_ctx.insert(
             "site_description".to_string(),
             self.config.site_info.description.to_string().into(),
         );
-        ctx.insert(
+        base_ctx.insert(
             "site_base_url".to_string(),
             self.config.site_info.base_url.to_string().into(),
         );
-        ctx.insert("indices".to_string(), build_indices_list(&indices));
-        ctx.insert("nav".to_string(), build_nav_list(&indices));
+        base_ctx.insert("indices".to_string(), build_indices_list(&indices));
+        base_ctx.insert("nav".to_string(), build_nav_list(&indices));
 
         debug!("Templating robots.txt");
         let robots_template_path = self
@@ -386,7 +386,8 @@ impl Website {
         let robots_template = tokio::fs::read_to_string(&robots_template_path)
             .await
             .map_err(|e| Error::ReadInput(robots_template_path.clone(), e))?;
-        let robots_txt = template::template(&self.config, ctx.clone(), robots_template).await?;
+        let robots_txt =
+            template::template(&self.config, base_ctx.clone(), robots_template).await?;
         let robots_txt_out = self.config.output_path.join("robots.txt");
         tokio::fs::write(&robots_txt_out, robots_txt)
             .await
@@ -401,13 +402,14 @@ impl Website {
         let sitemap_template = tokio::fs::read_to_string(&sitemap_template_path)
             .await
             .map_err(|e| Error::ReadInput(sitemap_template_path, e))?;
-        let sitemap_xml = template::template(&self.config, ctx.clone(), sitemap_template).await?;
+        let sitemap_xml =
+            template::template(&self.config, base_ctx.clone(), sitemap_template).await?;
         let sitemap_out = self.config.output_path.join("sitemap.xml");
         tokio::fs::write(&sitemap_out, sitemap_xml)
             .await
             .map_err(|e| Error::WriteFile(sitemap_out, e))?;
 
-        export_indices_to_html(Arc::clone(&self.config), opts, ctx, indices).await?;
+        export_indices_to_html(Arc::clone(&self.config), opts, base_ctx, indices).await?;
 
         mirror_assets_handle.await.map_err(Error::Join)??;
 
@@ -594,7 +596,7 @@ fn build_breadcrumb_chain(
 async fn export_indices_to_html(
     config: Arc<Config>,
     opts: &Cli,
-    mut ctx: Context,
+    base_ctx: Context,
     indices: Vec<Index>,
 ) -> Result<()> {
     for index in indices {
@@ -614,6 +616,7 @@ async fn export_indices_to_html(
             .map_err(|e| Error::CreateDirectory(dir, e))?;
 
         // Build index context
+        let mut ctx = base_ctx.clone();
         ctx.insert("pages".to_string(), build_pages_list(&index, opts));
         ctx.insert("title".to_string(), index.metadata.frontmatter.title.into());
         ctx.insert("content".to_string(), index.html.into());
@@ -662,7 +665,7 @@ async fn export_indices_to_html(
             .filter(|page| !page.metadata.frontmatter.draft || opts.drafts);
         for page in pages {
             let config = Arc::clone(&config);
-            let mut ctx = ctx.clone();
+            let mut ctx = base_ctx.clone();
             let templates_dir = templates_dir.clone();
 
             handles.push(tokio::spawn(async move {
