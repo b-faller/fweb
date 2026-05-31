@@ -1,7 +1,7 @@
 use std::{
+    collections::HashMap,
     ffi::OsStr,
-    fmt,
-    fmt::Write,
+    fmt::{self, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -31,6 +31,7 @@ mod template;
 use crate::{
     config::{Config, SiteInfo},
     error::{Error, Result},
+    json_ld::{Breadcrumb, SchemaType},
 };
 
 /// Date format used to display dates.
@@ -167,6 +168,7 @@ struct PageMetadata {
     filepath: PathBuf,
     canonical_url: String,
     og_type: OgType,
+    breadcrumbs: Vec<Breadcrumb>,
 }
 
 impl PageMetadata {
@@ -185,6 +187,7 @@ impl PageMetadata {
             filepath,
             canonical_url,
             og_type,
+            breadcrumbs: Vec::new(),
         }
     }
 }
@@ -247,7 +250,7 @@ struct IndexFrontmatter {
 
     /// Schema.org type for JSON-LD generation.
     #[serde(default)]
-    schema: json_ld::SchemaType,
+    schema: SchemaType,
 }
 
 fn default_index_template() -> PathBuf {
@@ -262,6 +265,7 @@ struct IndexMetadata {
     /// This path is relative to `content/`
     filepath: PathBuf,
     canonical_url: String,
+    breadcrumbs: Vec<Breadcrumb>,
 }
 
 impl IndexMetadata {
@@ -277,6 +281,7 @@ impl IndexMetadata {
             frontmatter,
             filepath,
             canonical_url,
+            breadcrumbs: Vec::new(),
         }
     }
 }
@@ -352,7 +357,8 @@ impl Website {
 
         // Read and parse content
         let content_dir = self.config.content_path.join("content");
-        let indices = load_and_parse_content(content_dir, Arc::clone(&self.config)).await?;
+        let mut indices = load_and_parse_content(content_dir, Arc::clone(&self.config)).await?;
+        populate_breadcrumbs(&mut indices);
 
         // Fill templating context
         let mut ctx = template::Context::new();
@@ -466,6 +472,87 @@ async fn load_and_parse_content(content_dir: PathBuf, config: Arc<Config>) -> Re
     Ok(indices)
 }
 
+/// Populate breadcrumbs for all indices and their pages after content is fully loaded.
+///
+/// Root is never included as an ancestor; the root index itself gets an empty chain.
+fn populate_breadcrumbs(indices: &mut [Index]) {
+    let by_dir: HashMap<PathBuf, Breadcrumb> = indices
+        .iter()
+        .map(|idx| {
+            let dir = idx
+                .metadata
+                .filepath
+                .parent()
+                .expect("Each filepath has parent")
+                .to_path_buf();
+            let breadcrumb = Breadcrumb {
+                name: idx.metadata.frontmatter.title.clone(),
+                url: idx.metadata.canonical_url.clone(),
+            };
+            (dir, breadcrumb)
+        })
+        .collect();
+
+    for index in indices.iter_mut() {
+        let dir = index
+            .metadata
+            .filepath
+            .parent()
+            .expect("Each file has a parent directory");
+
+        if dir != Path::new("") {
+            let current = Breadcrumb {
+                name: index.metadata.frontmatter.title.clone(),
+                url: index.metadata.canonical_url.clone(),
+            };
+            index.metadata.breadcrumbs = build_breadcrumb_chain(dir, false, current, &by_dir);
+        }
+
+        for page in index.pages.iter_mut() {
+            let parent = page
+                .metadata
+                .filepath
+                .parent()
+                .expect("Each file has a parent directory");
+            let current = Breadcrumb {
+                name: page.metadata.frontmatter.title.clone(),
+                url: page.metadata.canonical_url.clone(),
+            };
+            page.metadata.breadcrumbs = build_breadcrumb_chain(parent, true, current, &by_dir);
+        }
+    }
+}
+
+/// Builds a breadcrumb chain.
+///
+/// Root (`""`) is never included as an ancestor.
+/// `include_dir` = true for pages (include the immediate parent index in the chain),
+///               = false for indices (only ancestors strictly above `dir`).
+fn build_breadcrumb_chain(
+    dir: &Path,
+    include_dir: bool,
+    current: Breadcrumb,
+    by_dir: &std::collections::HashMap<PathBuf, Breadcrumb>,
+) -> Vec<Breadcrumb> {
+    let mut prefixes: Vec<PathBuf> = vec![];
+    let mut cur = PathBuf::new();
+    for component in dir.components() {
+        cur.push(component);
+        prefixes.push(cur.clone());
+    }
+    if !include_dir {
+        prefixes.pop();
+    }
+
+    let mut chain: Vec<Breadcrumb> = prefixes
+        .iter()
+        .filter_map(|p| by_dir.get(p).cloned())
+        .collect();
+
+    chain.push(current);
+    chain
+}
+
 /// Write all indices to disk.
 async fn export_indices_to_html(
     config: Arc<Config>,
@@ -505,6 +592,10 @@ async fn export_indices_to_html(
         ctx.insert(
             "schema_jsonld",
             json_ld::generate(index.metadata.frontmatter.schema, &ctx)?,
+        );
+        ctx.insert(
+            "breadcrumb_jsonld",
+            json_ld::generate_breadcrumbs(&index.metadata.breadcrumbs),
         );
 
         // Apply templating
@@ -562,6 +653,10 @@ async fn export_indices_to_html(
                 ctx.insert(
                     "schema_jsonld",
                     json_ld::generate(page.metadata.frontmatter.schema, &ctx)?,
+                );
+                ctx.insert(
+                    "breadcrumb_jsonld",
+                    json_ld::generate_breadcrumbs(&page.metadata.breadcrumbs),
                 );
 
                 // Apply templating
