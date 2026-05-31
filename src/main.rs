@@ -14,7 +14,7 @@ use time::{
     format_description::{
         well_known::{
             iso8601::{self, EncodedConfig, TimePrecision},
-            Iso8601,
+            Iso8601, Rfc2822, Rfc3339,
         },
         FormatItem,
     },
@@ -143,6 +143,21 @@ struct PageFrontmatter {
     draft: bool,
 }
 
+impl PageFrontmatter {
+    /// Validate schema-specific invariants the rest of the pipeline relies on.
+    fn validate(&self) -> Result<()> {
+        if self.schema == SchemaType::BlogPosting {
+            if self.date.is_none() {
+                return Err(Error::MissingSchemaField("date", "BlogPosting"));
+            }
+            if self.author.is_none() {
+                return Err(Error::MissingSchemaField("author", "BlogPosting"));
+            }
+        }
+        Ok(())
+    }
+}
+
 fn default_page_template() -> PathBuf {
     "page.html".into()
 }
@@ -213,6 +228,8 @@ impl Page {
         let (frontmatter_str, markdown) = parse_file(&content, file)?;
         let frontmatter: PageFrontmatter = toml::from_str(frontmatter_str)
             .map_err(|e| Error::ParseMetadata(relpath.as_ref().to_path_buf(), e))?;
+        frontmatter.validate()?;
+
         let filepath = relpath.as_ref().to_path_buf();
 
         Ok(Self {
@@ -245,7 +262,7 @@ impl Page {
             &meta.canonical_url,
             date_iso8601.as_deref(),
             fm.author.as_deref(),
-        )?;
+        );
         let breadcrumb_jsonld = json_ld::generate_breadcrumbs(&meta.breadcrumbs);
 
         ctx.insert("content".to_string(), self.html.into());
@@ -298,6 +315,16 @@ struct IndexFrontmatter {
     /// Schema.org type for JSON-LD generation.
     #[serde(default)]
     schema: SchemaType,
+}
+
+impl IndexFrontmatter {
+    /// Validate schema-specific invariants the rest of the pipeline relies on.
+    fn validate(&self) -> Result<()> {
+        if self.schema == SchemaType::BlogPosting {
+            return Err(Error::InvalidSchemaType(self.schema, "an index page"));
+        }
+        Ok(())
+    }
 }
 
 fn default_index_template() -> PathBuf {
@@ -358,6 +385,7 @@ impl Index {
         let (frontmatter_str, markdown) = parse_file(&content, file)?;
         let frontmatter: IndexFrontmatter = toml::from_str(frontmatter_str)
             .map_err(|e| Error::ParseMetadata(relpath.as_ref().to_path_buf(), e))?;
+        frontmatter.validate()?;
 
         Ok(Self {
             metadata: IndexMetadata::new(
@@ -387,7 +415,7 @@ impl Index {
             &meta.canonical_url,
             None,
             None,
-        )?;
+        );
         let breadcrumb_jsonld = json_ld::generate_breadcrumbs(&meta.breadcrumbs);
 
         ctx.insert("pages".to_string(), build_pages_list(&self.pages, opts));
@@ -429,11 +457,16 @@ impl Website {
         let base_ctx = self.base_context(&indices);
         let robots_handle = self.spawn_render_to_output(&base_ctx, "robots.txt");
         let sitemap_handle = self.spawn_render_to_output(&base_ctx, "sitemap.xml");
+        let feed_ctx = build_feed_context(&base_ctx, &indices, &self.config, opts);
+        let rss_handle = self.spawn_render_to_output(&feed_ctx, "feed.xml");
+        let atom_handle = self.spawn_render_to_output(&feed_ctx, "atom.xml");
         render_and_write_html(Arc::clone(&self.config), opts, base_ctx, indices).await?;
 
         mirror_handle.await.map_err(Error::Join)??;
         robots_handle.await.map_err(Error::Join)??;
         sitemap_handle.await.map_err(Error::Join)??;
+        rss_handle.await.map_err(Error::Join)??;
+        atom_handle.await.map_err(Error::Join)??;
 
         Ok(())
     }
@@ -898,6 +931,85 @@ fn build_indices_list(indices: &[Index]) -> TemplateValue {
     TemplateValue::List(items)
 }
 
+/// Build the templating context for the RSS and Atom feeds.
+fn build_feed_context(
+    base_ctx: &Context,
+    indices: &[Index],
+    config: &Config,
+    opts: &Cli,
+) -> Context {
+    let mut articles: Vec<&Page> = indices
+        .iter()
+        .flat_map(|index| index.pages.iter())
+        .filter(|page| page.metadata.frontmatter.schema == SchemaType::BlogPosting)
+        .filter(|page| !page.metadata.frontmatter.draft || opts.drafts)
+        .collect();
+    articles.sort_by_key(|page| {
+        std::cmp::Reverse(
+            page.metadata
+                .frontmatter
+                .date
+                .expect("A BlogPosting is dated"),
+        )
+    });
+
+    let items = articles
+        .iter()
+        .map(|page| {
+            let fm = &page.metadata.frontmatter;
+            let mut item = Context::new();
+            item.insert("title".to_string(), xml_escape(&fm.title).into());
+            item.insert(
+                "url".to_string(),
+                xml_escape(&page.metadata.canonical_url).into(),
+            );
+            if let Some(summary) = fm.excerpt.as_deref().or(fm.description.as_deref()) {
+                item.insert("description".to_string(), xml_escape(summary).into());
+            }
+            let content = absolutize_urls(&page.html, &config.site_info.base_url);
+            item.insert("content".to_string(), xml_escape(&content).into());
+            if let Some(author) = fm.author.as_deref() {
+                item.insert("author".to_string(), xml_escape(author).into());
+            }
+            let date = fm.date.expect("A BlogPosting is dated");
+            item.insert("date_rfc822".to_string(), format_date_rfc2822(&date).into());
+            item.insert(
+                "date_rfc3339".to_string(),
+                format_date_rfc3339(&date).into(),
+            );
+            item
+        })
+        .collect();
+
+    let mut ctx = base_ctx.clone();
+    ctx.insert(
+        "feed_title".to_string(),
+        xml_escape(&config.site_info.title).into(),
+    );
+    ctx.insert(
+        "feed_description".to_string(),
+        xml_escape(&config.site_info.description).into(),
+    );
+    // Feed-level timestamp from the newest article (RFC 3339 for Atom, RFC 822 for RSS).
+    if let Some(latest) = articles.first().map(|page| {
+        page.metadata
+            .frontmatter
+            .date
+            .expect("A BlogPosting is dated")
+    }) {
+        ctx.insert(
+            "feed_updated".to_string(),
+            format_date_rfc3339(&latest).into(),
+        );
+        ctx.insert(
+            "feed_updated_rfc822".to_string(),
+            format_date_rfc2822(&latest).into(),
+        );
+    }
+    ctx.insert("feed_items".to_string(), TemplateValue::List(items));
+    ctx
+}
+
 fn format_date_iso8601(date: &OffsetDateTime) -> String {
     date.format(&Iso8601::<DATE_ISO_CONFIG>)
         .expect("date already validated")
@@ -907,6 +1019,39 @@ fn format_date_utc(date: &OffsetDateTime) -> String {
     date.to_offset(time::macros::offset!(UTC))
         .format(&DATE_FORMAT)
         .expect("date already validated")
+}
+
+/// Format a date as RFC 822 / 2822, used for RSS `<pubDate>`/`<lastBuildDate>`.
+fn format_date_rfc2822(date: &OffsetDateTime) -> String {
+    date.format(&Rfc2822).expect("date already validated")
+}
+
+/// Format a date as RFC 3339, used for Atom `<updated>`/`<published>`.
+fn format_date_rfc3339(date: &OffsetDateTime) -> String {
+    date.format(&Rfc3339).expect("date already validated")
+}
+
+/// Escape to XML text or attribute context.
+fn xml_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Rewrite root-relative `src`/`href` attributes in rendered HTML to absolute URLs
+/// rooted at `base_url`.
+fn absolutize_urls(html: &str, base_url: &str) -> String {
+    html.replace("src=\"/", &format!("src=\"{base_url}/"))
+        .replace("href=\"/", &format!("href=\"{base_url}/"))
 }
 
 /// Mirror the assets fully.

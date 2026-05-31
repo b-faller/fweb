@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use thiserror::Error as ErrorTrait;
 
+use crate::json_ld::SchemaType;
+
 #[derive(Debug, ErrorTrait)]
 pub enum Error {
     #[error("Cleaning output directory {0} failed: {1}")]
@@ -51,6 +53,9 @@ pub enum Error {
 
     #[error("Missing required field '{0}' for schema type '{1}'")]
     MissingSchemaField(&'static str, &'static str),
+
+    #[error("Schema type '{0}' is not valid for {1}")]
+    InvalidSchemaType(SchemaType, &'static str),
 }
 
 /// Wrapper around the [Error]

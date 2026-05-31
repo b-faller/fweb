@@ -1,9 +1,6 @@
 use serde::Deserialize;
 
-use crate::{
-    config::SiteInfo,
-    error::{Error, Result},
-};
+use crate::config::SiteInfo;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Breadcrumb {
@@ -12,7 +9,7 @@ pub(crate) struct Breadcrumb {
 }
 
 /// Schema.org type declared in page or index frontmatter.
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) enum SchemaType {
     WebSite,
@@ -22,7 +19,22 @@ pub(crate) enum SchemaType {
     BlogPosting,
 }
 
+impl std::fmt::Display for SchemaType {
+    /// Renders the schema.org type name as it appears in JSON-LD `@type`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            SchemaType::WebSite => "WebSite",
+            SchemaType::WebPage => "WebPage",
+            SchemaType::Blog => "Blog",
+            SchemaType::BlogPosting => "BlogPosting",
+        };
+        f.write_str(name)
+    }
+}
+
 /// Generate a JSON-LD `<script>` tag from the given schema type and typed fields.
+///
+/// The caller is responsible for ensuring that `date` and `author` is present when a [SchemaType::BlogPosting] is chosen.
 pub(crate) fn generate(
     schema: SchemaType,
     site: &SiteInfo,
@@ -31,7 +43,7 @@ pub(crate) fn generate(
     url: &str,
     date_iso8601: Option<&str>,
     author: Option<&str>,
-) -> Result<String> {
+) -> String {
     let json = match schema {
         SchemaType::WebSite => serde_json::json!({
             "@context": "https://schema.org",
@@ -55,8 +67,8 @@ pub(crate) fn generate(
             "url": url,
         }),
         SchemaType::BlogPosting => {
-            let date = date_iso8601.ok_or(Error::MissingSchemaField("date", "BlogPosting"))?;
-            let author = author.ok_or(Error::MissingSchemaField("author", "BlogPosting"))?;
+            let date = date_iso8601.expect("A BlogPosting is dated");
+            let author = author.expect("A BlogPosting has an author");
             serde_json::json!({
                 "@context": "https://schema.org",
                 "@type": "BlogPosting",
@@ -69,9 +81,7 @@ pub(crate) fn generate(
         }
     };
 
-    Ok(format!(
-        "<script type=\"application/ld+json\">{json}</script>"
-    ))
+    format!("<script type=\"application/ld+json\">{json}</script>")
 }
 
 /// Generate a BreadcrumbList JSON-LD `<script>` tag.
