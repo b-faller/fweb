@@ -1,8 +1,8 @@
 use serde::Deserialize;
 
 use crate::{
+    config::SiteInfo,
     error::{Error, Result},
-    template::Context,
 };
 
 #[derive(Debug, Clone)]
@@ -22,46 +22,47 @@ pub(crate) enum SchemaType {
     BlogPosting,
 }
 
-/// Generate a JSON-LD `<script>` tag from the given schema type and template context.
-///
-/// Reads values already present in the template context. Returns an error if
-/// a required field for the declared schema type is absent from the context.
-pub(crate) fn generate(schema: SchemaType, ctx: &Context) -> Result<String> {
-    let get_scalar = |key| ctx.get(key).and_then(|v| v.as_scalar());
-
+/// Generate a JSON-LD `<script>` tag from the given schema type and typed fields.
+pub(crate) fn generate(
+    schema: SchemaType,
+    site: &SiteInfo,
+    title: &str,
+    description: &str,
+    url: &str,
+    date_iso8601: Option<&str>,
+    author: Option<&str>,
+) -> Result<String> {
     let json = match schema {
         SchemaType::WebSite => serde_json::json!({
             "@context": "https://schema.org",
             "@type": "WebSite",
-            "name": get_scalar("site_title"),
-            "description": get_scalar("site_description"),
-            "url": get_scalar("canonical_url"),
+            "name": site.title,
+            "description": site.description,
+            "url": url,
         }),
         SchemaType::Blog => serde_json::json!({
             "@context": "https://schema.org",
             "@type": "Blog",
-            "name": get_scalar("title"),
-            "description": get_scalar("description"),
-            "url": get_scalar("canonical_url"),
+            "name": title,
+            "description": description,
+            "url": url,
         }),
         SchemaType::WebPage => serde_json::json!({
             "@context": "https://schema.org",
             "@type": "WebPage",
-            "name": get_scalar("title"),
-            "description": get_scalar("description"),
-            "url": get_scalar("canonical_url"),
+            "name": title,
+            "description": description,
+            "url": url,
         }),
         SchemaType::BlogPosting => {
-            let date = get_scalar("date_iso8601")
-                .ok_or(Error::MissingSchemaField("date", "BlogPosting"))?;
-            let author =
-                get_scalar("author").ok_or(Error::MissingSchemaField("author", "BlogPosting"))?;
+            let date = date_iso8601.ok_or(Error::MissingSchemaField("date", "BlogPosting"))?;
+            let author = author.ok_or(Error::MissingSchemaField("author", "BlogPosting"))?;
             serde_json::json!({
                 "@context": "https://schema.org",
                 "@type": "BlogPosting",
-                "headline": get_scalar("title"),
-                "description": get_scalar("description"),
-                "url": get_scalar("canonical_url"),
+                "headline": title,
+                "description": description,
+                "url": url,
                 "datePublished": date,
                 "author": {"@type": "Person", "name": author},
             })

@@ -220,6 +220,53 @@ impl Page {
             html: convert_markdown(markdown),
         })
     }
+
+    /// Extend the base context `ctx` with this page's fields for rendering.
+    ///
+    /// Consumes the page so that the HTML is moved.
+    fn into_context(self, mut ctx: Context, config: &Config) -> Result<Context> {
+        let meta = self.metadata;
+        let fm = meta.frontmatter;
+
+        // Derived presentation fields, computed once and reused below.
+        let description = fm
+            .description
+            .as_deref()
+            .or(fm.excerpt.as_deref())
+            .unwrap_or(&config.site_info.description)
+            .to_string();
+        let date_iso8601 = fm.date.map(|d| format_date_iso8601(&d));
+        let date_utc = fm.date.map(|d| format_date_utc(&d));
+        let schema_jsonld = json_ld::generate(
+            fm.schema,
+            &config.site_info,
+            &fm.title,
+            &description,
+            &meta.canonical_url,
+            date_iso8601.as_deref(),
+            fm.author.as_deref(),
+        )?;
+        let breadcrumb_jsonld = json_ld::generate_breadcrumbs(&meta.breadcrumbs);
+
+        ctx.insert("content".to_string(), self.html.into());
+        ctx.insert("title".to_string(), fm.title.into());
+        ctx.insert("canonical_url".to_string(), meta.canonical_url.into());
+        ctx.insert("og_type".to_string(), meta.og_type.to_string().into());
+        ctx.insert("description".to_string(), description.into());
+        if let Some(excerpt) = fm.excerpt {
+            ctx.insert("excerpt".to_string(), excerpt.into());
+        }
+        if let Some(author) = fm.author {
+            ctx.insert("author".to_string(), author.into());
+        }
+        if let (Some(iso), Some(utc)) = (date_iso8601, date_utc) {
+            ctx.insert("date_iso8601".to_string(), iso.into());
+            ctx.insert("date".to_string(), utc.into());
+        }
+        ctx.insert("schema_jsonld".to_string(), schema_jsonld.into());
+        ctx.insert("breadcrumb_jsonld".to_string(), breadcrumb_jsonld.into());
+        Ok(ctx)
+    }
 }
 
 /// Frontmatter parsed directly from an index's TOML header.
@@ -321,6 +368,40 @@ impl Index {
             html: convert_markdown(markdown),
             pages: Vec::new(),
         })
+    }
+
+    /// Extend the base context `ctx` with this index's fields for rendering.
+    fn to_context(&self, mut ctx: Context, config: &Config, opts: &Cli) -> Result<Context> {
+        let meta = &self.metadata;
+        let fm = &meta.frontmatter;
+
+        let description = fm
+            .description
+            .clone()
+            .unwrap_or_else(|| config.site_info.description.clone());
+        let schema_jsonld = json_ld::generate(
+            fm.schema,
+            &config.site_info,
+            &fm.title,
+            &description,
+            &meta.canonical_url,
+            None,
+            None,
+        )?;
+        let breadcrumb_jsonld = json_ld::generate_breadcrumbs(&meta.breadcrumbs);
+
+        ctx.insert("pages".to_string(), build_pages_list(&self.pages, opts));
+        ctx.insert("title".to_string(), fm.title.clone().into());
+        ctx.insert("content".to_string(), self.html.clone().into());
+        ctx.insert(
+            "canonical_url".to_string(),
+            meta.canonical_url.clone().into(),
+        );
+        ctx.insert("og_type".to_string(), OgType::Website.to_string().into());
+        ctx.insert("description".to_string(), description.into());
+        ctx.insert("schema_jsonld".to_string(), schema_jsonld.into());
+        ctx.insert("breadcrumb_jsonld".to_string(), breadcrumb_jsonld.into());
+        Ok(ctx)
     }
 }
 
@@ -628,32 +709,7 @@ async fn render_and_write_html(
             .map_err(|e| Error::CreateDirectory(dir, e))?;
 
         // Build index context
-        let mut ctx = base_ctx.clone();
-        ctx.insert("pages".to_string(), build_pages_list(&index, opts));
-        ctx.insert("title".to_string(), index.metadata.frontmatter.title.into());
-        ctx.insert("content".to_string(), index.html.into());
-        ctx.insert(
-            "canonical_url".to_string(),
-            index.metadata.canonical_url.into(),
-        );
-        ctx.insert("og_type".to_string(), OgType::Website.to_string().into());
-        ctx.insert(
-            "description".to_string(),
-            index
-                .metadata
-                .frontmatter
-                .description
-                .unwrap_or(config.site_info.description.to_string())
-                .into(),
-        );
-        ctx.insert(
-            "schema_jsonld".to_string(),
-            json_ld::generate(index.metadata.frontmatter.schema, &ctx)?.into(),
-        );
-        ctx.insert(
-            "breadcrumb_jsonld".to_string(),
-            json_ld::generate_breadcrumbs(&index.metadata.breadcrumbs).into(),
-        );
+        let ctx = index.to_context(base_ctx.clone(), &config, opts)?;
 
         // Apply templating
         let templates_dir = config.content_path.join("templates");
@@ -662,7 +718,7 @@ async fn render_and_write_html(
         let template = tokio::fs::read_to_string(&template_path)
             .await
             .map_err(|e| Error::ReadInput(template_path, e))?;
-        let html = template::template(&config, ctx.clone(), template).await?;
+        let html = template::template(&config, ctx, template).await?;
 
         // Write index.html
         tokio::fs::write(&file, html)
@@ -677,69 +733,35 @@ async fn render_and_write_html(
             .filter(|page| !page.metadata.frontmatter.draft || opts.drafts);
         for page in pages {
             let config = Arc::clone(&config);
-            let mut ctx = base_ctx.clone();
+            let ctx = base_ctx.clone();
             let templates_dir = templates_dir.clone();
 
             handles.push(tokio::spawn(async move {
                 debug!("Building page '{:?}'", &page.metadata);
 
+                // Resolve output paths before the page is consumed into the context.
+                let template_path = templates_dir.join(&page.metadata.frontmatter.template);
+                let dir = config
+                    .output_path
+                    .join(
+                        page.metadata
+                            .filepath
+                            .parent()
+                            .expect("Each file has a parent directory"),
+                    )
+                    .join(&page.metadata.frontmatter.id);
+
                 // Build page context
-                ctx.insert("content".to_string(), page.html.into());
-                ctx.insert("title".to_string(), page.metadata.frontmatter.title.into());
-                ctx.insert(
-                    "canonical_url".to_string(),
-                    page.metadata.canonical_url.into(),
-                );
-                ctx.insert(
-                    "og_type".to_string(),
-                    page.metadata.og_type.to_string().into(),
-                );
-                ctx.insert(
-                    "description".to_string(),
-                    page.metadata
-                        .frontmatter
-                        .description
-                        .as_deref()
-                        .or(page.metadata.frontmatter.excerpt.as_deref())
-                        .unwrap_or(&config.site_info.description)
-                        .to_string()
-                        .into(),
-                );
-                if let Some(excerpt) = page.metadata.frontmatter.excerpt {
-                    ctx.insert("excerpt".to_string(), excerpt.into());
-                }
-                if let Some(author) = page.metadata.frontmatter.author {
-                    ctx.insert("author".to_string(), author.into());
-                }
-                if let Some(date) = page.metadata.frontmatter.date {
-                    ctx.insert(
-                        "date_iso8601".to_string(),
-                        format_date_iso8601(&date).into(),
-                    );
-                    ctx.insert("date".to_string(), format_date_utc(&date).into());
-                }
-                ctx.insert(
-                    "schema_jsonld".to_string(),
-                    json_ld::generate(page.metadata.frontmatter.schema, &ctx)?.into(),
-                );
-                ctx.insert(
-                    "breadcrumb_jsonld".to_string(),
-                    json_ld::generate_breadcrumbs(&page.metadata.breadcrumbs).into(),
-                );
+                let ctx = page.into_context(ctx, &config)?;
 
                 // Apply templating
-                let template_path = templates_dir.join(&page.metadata.frontmatter.template);
                 let template = tokio::fs::read_to_string(&template_path)
                     .await
                     .map_err(|e| Error::ReadInput(template_path, e))?;
                 let html = template::template(&config, ctx, template).await?;
 
                 // Write page HTML to file
-                let dir = config
-                    .output_path
-                    .join(page.metadata.filepath.parent().unwrap())
-                    .join(page.metadata.frontmatter.id);
-                tokio::fs::create_dir_all(dir.clone())
+                tokio::fs::create_dir_all(&dir)
                     .await
                     .map_err(|e| Error::CreateDirectory(dir.clone(), e))?;
                 let path = dir.join("index.html");
@@ -808,13 +830,16 @@ fn build_nav_list(indices: &[Index]) -> TemplateValue {
 /// Build the pages list for a single index, suitable for template rendering.
 ///
 /// Each item carries: `url`, `title`, and optionally `date`, `date_iso8601`, `excerpt`.
-fn build_pages_list(index: &Index, opts: &Cli) -> TemplateValue {
-    let items = index
-        .pages
+fn build_pages_list(pages: &[Page], opts: &Cli) -> TemplateValue {
+    let items = pages
         .iter()
         .filter(|page| !page.metadata.frontmatter.draft || opts.drafts)
         .map(|page| {
-            let parent = page.metadata.filepath.parent().unwrap();
+            let parent = page
+                .metadata
+                .filepath
+                .parent()
+                .expect("Each file has a parent directory");
             let url = if parent == Path::new("") {
                 format!("/{}/", page.metadata.frontmatter.id)
             } else {
