@@ -26,6 +26,7 @@ use time::{
 mod config;
 mod error;
 mod json_ld;
+mod sitemap;
 mod template;
 
 use crate::{
@@ -369,6 +370,26 @@ impl Website {
             "site_description",
             self.config.site_info.description.to_string(),
         );
+        ctx.insert("site_base_url", self.config.site_info.base_url.to_string());
+
+        let robots_template_path = self
+            .config
+            .content_path
+            .join("templates")
+            .join("robots.txt");
+        let robots_template = tokio::fs::read_to_string(&robots_template_path)
+            .await
+            .map_err(|e| Error::ReadInput(robots_template_path.clone(), e))?;
+        let robots_txt = template::template(&self.config, &ctx, robots_template).await?;
+        let robots_txt_path = self.config.output_path.join("robots.txt");
+        tokio::fs::write(&robots_txt_path, robots_txt)
+            .await
+            .map_err(|e| Error::WriteFile(robots_template_path, e))?;
+
+        let sitemap_xml = sitemap::generate(&indices);
+        tokio::fs::write(self.config.output_path.join("sitemap.xml"), sitemap_xml)
+            .await
+            .map_err(|e| Error::WriteFile(self.config.output_path.join("sitemap.xml"), e))?;
 
         export_indices_to_html(Arc::clone(&self.config), opts, ctx, indices).await?;
 
