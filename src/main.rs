@@ -25,6 +25,7 @@ use time::{
 
 mod config;
 mod error;
+mod json_ld;
 mod template;
 
 use crate::{
@@ -111,6 +112,10 @@ struct PageFrontmatter {
     /// their weight in normal numerical order
     weight: Option<i32>,
 
+    /// Author of the page.
+    #[serde(default)]
+    author: Option<String>,
+
     /// Excerpt of the post content.
     #[serde(default)]
     excerpt: Option<String>,
@@ -125,6 +130,10 @@ struct PageFrontmatter {
     /// This path is relative to `templates/`
     #[serde(default = "default_page_template")]
     template: PathBuf,
+
+    /// Schema.org type for JSON-LD generation.
+    #[serde(default)]
+    schema: json_ld::SchemaType,
 
     /// Whether the page is a draft.
     ///
@@ -235,6 +244,10 @@ struct IndexFrontmatter {
     /// This path is relative to `templates/`
     #[serde(default = "default_index_template")]
     template: PathBuf,
+
+    /// Schema.org type for JSON-LD generation.
+    #[serde(default)]
+    schema: json_ld::SchemaType,
 }
 
 fn default_index_template() -> PathBuf {
@@ -489,6 +502,10 @@ async fn export_indices_to_html(
                 .description
                 .unwrap_or(config.site_info.description.to_string()),
         );
+        ctx.insert(
+            "schema_jsonld",
+            json_ld::generate(index.metadata.frontmatter.schema, &ctx)?,
+        );
 
         // Apply templating
         let templates_dir = config.content_path.join("templates");
@@ -535,10 +552,17 @@ async fn export_indices_to_html(
                 if let Some(excerpt) = page.metadata.frontmatter.excerpt {
                     ctx.insert("excerpt", excerpt);
                 }
+                if let Some(author) = page.metadata.frontmatter.author {
+                    ctx.insert("author", author);
+                }
                 if let Some(date) = page.metadata.frontmatter.date {
                     ctx.insert("date_iso8601", format_date_iso8601(&date));
                     ctx.insert("date", format_date_utc(&date));
                 }
+                ctx.insert(
+                    "schema_jsonld",
+                    json_ld::generate(page.metadata.frontmatter.schema, &ctx)?,
+                );
 
                 // Apply templating
                 let template_path = templates_dir.join(&page.metadata.frontmatter.template);

@@ -45,6 +45,9 @@ pub enum Error {
 
     #[error("Tag '{0}' does not exist")]
     TagNotFound(String),
+
+    #[error("Missing required field '{0}' for schema type '{1}'")]
+    MissingSchemaField(&'static str, &'static str),
 }
 
 /// Wrapper around the [Error]
