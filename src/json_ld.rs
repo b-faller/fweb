@@ -32,52 +32,59 @@ impl std::fmt::Display for SchemaType {
     }
 }
 
+/// The page data used to build the JSON-LD.
+#[derive(Debug, Default)]
+pub(crate) struct PageFields<'a> {
+    pub(crate) title: &'a str,
+    pub(crate) description: &'a str,
+    pub(crate) url: &'a str,
+    pub(crate) date_iso8601: Option<&'a str>,
+    pub(crate) updated_iso8601: Option<&'a str>,
+    pub(crate) author: Option<&'a str>,
+}
+
 /// Generate a JSON-LD `<script>` tag from the given schema type and typed fields.
 ///
 /// The caller is responsible for ensuring that `date` and `author` is present when a [SchemaType::BlogPosting] is chosen.
-pub(crate) fn generate(
-    schema: SchemaType,
-    site: &SiteInfo,
-    title: &str,
-    description: &str,
-    url: &str,
-    date_iso8601: Option<&str>,
-    author: Option<&str>,
-) -> String {
+pub(crate) fn generate(schema: SchemaType, site: &SiteInfo, page: &PageFields) -> String {
     let json = match schema {
         SchemaType::WebSite => serde_json::json!({
             "@context": "https://schema.org",
             "@type": "WebSite",
             "name": site.title,
             "description": site.description,
-            "url": url,
+            "url": page.url,
         }),
         SchemaType::Blog => serde_json::json!({
             "@context": "https://schema.org",
             "@type": "Blog",
-            "name": title,
-            "description": description,
-            "url": url,
+            "name": page.title,
+            "description": page.description,
+            "url": page.url,
         }),
         SchemaType::WebPage => serde_json::json!({
             "@context": "https://schema.org",
             "@type": "WebPage",
-            "name": title,
-            "description": description,
-            "url": url,
+            "name": page.title,
+            "description": page.description,
+            "url": page.url,
         }),
         SchemaType::BlogPosting => {
-            let date = date_iso8601.expect("A BlogPosting is dated");
-            let author = author.expect("A BlogPosting has an author");
-            serde_json::json!({
+            let date = page.date_iso8601.expect("A BlogPosting is dated");
+            let author = page.author.expect("A BlogPosting has an author");
+            let mut json = serde_json::json!({
                 "@context": "https://schema.org",
                 "@type": "BlogPosting",
-                "headline": title,
-                "description": description,
-                "url": url,
+                "headline": page.title,
+                "description": page.description,
+                "url": page.url,
                 "datePublished": date,
                 "author": {"@type": "Person", "name": author},
-            })
+            });
+            if let Some(updated) = page.updated_iso8601 {
+                json["dateModified"] = updated.into();
+            }
+            json
         }
     };
 

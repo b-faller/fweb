@@ -29,7 +29,7 @@ mod template;
 
 use crate::{
     config::{Config, SiteInfo},
-    error::{Error, Result},
+    error::{Error, Result, ValidationError},
     json_ld::{Breadcrumb, SchemaType},
     template::{Context, TemplateValue},
 };
@@ -126,6 +126,11 @@ struct PageFrontmatter {
     #[serde(deserialize_with = "optional_datetime")]
     date: Option<OffsetDateTime>,
 
+    /// Date when the page was last updated.
+    #[serde(default)]
+    #[serde(deserialize_with = "optional_datetime")]
+    updated: Option<OffsetDateTime>,
+
     /// Template file to use.
     ///
     /// This path is relative to `templates/`
@@ -145,16 +150,22 @@ struct PageFrontmatter {
 
 impl PageFrontmatter {
     /// Validate schema-specific invariants the rest of the pipeline relies on.
-    fn validate(&self) -> Result<()> {
+    fn validate(&self) -> std::result::Result<(), ValidationError> {
         if self.schema == SchemaType::BlogPosting {
             if self.date.is_none() {
-                return Err(Error::MissingSchemaField("date", "BlogPosting"));
+                return Err(ValidationError::MissingSchemaField("date", "BlogPosting"));
             }
             if self.author.is_none() {
-                return Err(Error::MissingSchemaField("author", "BlogPosting"));
+                return Err(ValidationError::MissingSchemaField("author", "BlogPosting"));
             }
         }
-        Ok(())
+        match (self.date, self.updated) {
+            (None, Some(_)) => Err(ValidationError::UpdatedWithoutDate),
+            (Some(date), Some(updated)) if updated < date => {
+                Err(ValidationError::UpdatedBeforeDate)
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -228,7 +239,9 @@ impl Page {
         let (frontmatter_str, markdown) = parse_file(&content, file)?;
         let frontmatter: PageFrontmatter = toml::from_str(frontmatter_str)
             .map_err(|e| Error::ParseMetadata(relpath.as_ref().to_path_buf(), e))?;
-        frontmatter.validate()?;
+        frontmatter
+            .validate()
+            .map_err(|e| Error::Validation(relpath.as_ref().to_path_buf(), e))?;
 
         let filepath = relpath.as_ref().to_path_buf();
 
@@ -254,14 +267,19 @@ impl Page {
             .to_string();
         let date_iso8601 = fm.date.map(|d| format_date_iso8601(&d));
         let date_utc = fm.date.map(|d| format_date_utc(&d));
+        let updated_iso8601 = fm.updated.map(|d| format_date_iso8601(&d));
+        let updated_utc = fm.updated.map(|d| format_date_utc(&d));
         let schema_jsonld = json_ld::generate(
             fm.schema,
             &config.site_info,
-            &fm.title,
-            &description,
-            &meta.canonical_url,
-            date_iso8601.as_deref(),
-            fm.author.as_deref(),
+            &json_ld::PageFields {
+                title: &fm.title,
+                description: &description,
+                url: &meta.canonical_url,
+                date_iso8601: date_iso8601.as_deref(),
+                updated_iso8601: updated_iso8601.as_deref(),
+                author: fm.author.as_deref(),
+            },
         );
         let breadcrumb_jsonld = json_ld::generate_breadcrumbs(&meta.breadcrumbs);
 
@@ -279,6 +297,10 @@ impl Page {
         if let (Some(iso), Some(utc)) = (date_iso8601, date_utc) {
             ctx.insert("date_iso8601".to_string(), iso.into());
             ctx.insert("date".to_string(), utc.into());
+        }
+        if let (Some(iso), Some(utc)) = (updated_iso8601, updated_utc) {
+            ctx.insert("updated_iso8601".to_string(), iso.into());
+            ctx.insert("updated".to_string(), utc.into());
         }
         ctx.insert("schema_jsonld".to_string(), schema_jsonld.into());
         ctx.insert("breadcrumb_jsonld".to_string(), breadcrumb_jsonld.into());
@@ -319,9 +341,12 @@ struct IndexFrontmatter {
 
 impl IndexFrontmatter {
     /// Validate schema-specific invariants the rest of the pipeline relies on.
-    fn validate(&self) -> Result<()> {
+    fn validate(&self) -> std::result::Result<(), ValidationError> {
         if self.schema == SchemaType::BlogPosting {
-            return Err(Error::InvalidSchemaType(self.schema, "an index page"));
+            return Err(ValidationError::InvalidSchemaType(
+                self.schema,
+                "an index page",
+            ));
         }
         Ok(())
     }
@@ -385,7 +410,9 @@ impl Index {
         let (frontmatter_str, markdown) = parse_file(&content, file)?;
         let frontmatter: IndexFrontmatter = toml::from_str(frontmatter_str)
             .map_err(|e| Error::ParseMetadata(relpath.as_ref().to_path_buf(), e))?;
-        frontmatter.validate()?;
+        frontmatter
+            .validate()
+            .map_err(|e| Error::Validation(relpath.as_ref().to_path_buf(), e))?;
 
         Ok(Self {
             metadata: IndexMetadata::new(
@@ -410,11 +437,12 @@ impl Index {
         let schema_jsonld = json_ld::generate(
             fm.schema,
             &config.site_info,
-            &fm.title,
-            &description,
-            &meta.canonical_url,
-            None,
-            None,
+            &json_ld::PageFields {
+                title: &fm.title,
+                description: &description,
+                url: &meta.canonical_url,
+                ..Default::default()
+            },
         );
         let breadcrumb_jsonld = json_ld::generate_breadcrumbs(&meta.breadcrumbs);
 
@@ -770,7 +798,7 @@ async fn render_and_write_html(
             let templates_dir = templates_dir.clone();
 
             handles.push(tokio::spawn(async move {
-                debug!("Building page '{:?}'", &page.metadata);
+                debug!("Building page '{:?}'", page.metadata);
 
                 // Resolve output paths before the page is consumed into the context.
                 let template_path = templates_dir.join(&page.metadata.frontmatter.template);
@@ -861,8 +889,6 @@ fn build_nav_list(indices: &[Index]) -> TemplateValue {
 }
 
 /// Build the pages list for a single index, suitable for template rendering.
-///
-/// Each item carries: `url`, `title`, and optionally `date`, `date_iso8601`, `excerpt`.
 fn build_pages_list(pages: &[Page], opts: &Cli) -> TemplateValue {
     let items = pages
         .iter()
@@ -892,6 +918,13 @@ fn build_pages_list(pages: &[Page], opts: &Cli) -> TemplateValue {
                 item.insert(
                     "date_iso8601".to_string(),
                     format_date_iso8601(&date).into(),
+                );
+            }
+            if let Some(updated) = page.metadata.frontmatter.updated {
+                item.insert("updated".to_string(), format_date_utc(&updated).into());
+                item.insert(
+                    "updated_iso8601".to_string(),
+                    format_date_iso8601(&updated).into(),
                 );
             }
             item
@@ -977,6 +1010,12 @@ fn build_feed_context(
                 "date_rfc3339".to_string(),
                 format_date_rfc3339(&date).into(),
             );
+            if let Some(updated) = fm.updated {
+                item.insert(
+                    "updated_rfc3339".to_string(),
+                    format_date_rfc3339(&updated).into(),
+                );
+            }
             item
         })
         .collect();
@@ -990,13 +1029,15 @@ fn build_feed_context(
         "feed_description".to_string(),
         xml_escape(&config.site_info.description).into(),
     );
-    // Feed-level timestamp from the newest article (RFC 3339 for Atom, RFC 822 for RSS).
-    if let Some(latest) = articles.first().map(|page| {
-        page.metadata
-            .frontmatter
-            .date
-            .expect("A BlogPosting is dated")
-    }) {
+    // Feed-level timestamp from the latest publish or update (RFC 3339 for Atom, RFC 822 for RSS).
+    if let Some(latest) = articles
+        .iter()
+        .map(|page| {
+            let fm = &page.metadata.frontmatter;
+            fm.updated.or(fm.date).expect("A BlogPosting is dated")
+        })
+        .max()
+    {
         ctx.insert(
             "feed_updated".to_string(),
             format_date_rfc3339(&latest).into(),
@@ -1144,5 +1185,47 @@ async fn main() {
     if let Err(e) = try_main().await {
         error!("{}", e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn validate(extra: &str) -> std::result::Result<(), ValidationError> {
+        let fm: PageFrontmatter = toml::from_str(&format!("id = \"p\"\ntitle = \"P\"\n{extra}"))
+            .expect("valid frontmatter");
+        fm.validate()
+    }
+
+    #[test]
+    fn test_updated_after_date() {
+        assert!(
+            validate("date = \"2024-01-01T00:00:00Z\"\nupdated = \"2024-02-01T00:00:00Z\"").is_ok()
+        );
+    }
+
+    #[test]
+    fn test_updated_equal_to_date() {
+        assert!(validate(
+            "date = \"2024-01-01T00:00:00Z\"\nupdated = \"2024-01-01T01:00:00+01:00\""
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_updated_without_date() {
+        assert!(matches!(
+            validate("updated = \"2024-01-01T00:00:00Z\""),
+            Err(ValidationError::UpdatedWithoutDate)
+        ));
+    }
+
+    #[test]
+    fn test_updated_before_date() {
+        assert!(matches!(
+            validate("date = \"2024-02-01T00:00:00Z\"\nupdated = \"2024-01-01T00:00:00Z\""),
+            Err(ValidationError::UpdatedBeforeDate)
+        ));
     }
 }

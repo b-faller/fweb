@@ -51,11 +51,24 @@ pub enum Error {
     #[error("Unterminated '{0}' block")]
     UnterminatedBlock(String),
 
+    #[error("Validation failed for {0}: {1}")]
+    Validation(PathBuf, ValidationError),
+}
+
+/// Errors when validating the frontmatter.
+#[derive(Debug, ErrorTrait)]
+pub enum ValidationError {
     #[error("Missing required field '{0}' for schema type '{1}'")]
     MissingSchemaField(&'static str, &'static str),
 
     #[error("Schema type '{0}' is not valid for {1}")]
     InvalidSchemaType(SchemaType, &'static str),
+
+    #[error("Field 'updated' requires 'date' to be set")]
+    UpdatedWithoutDate,
+
+    #[error("Field 'updated' is earlier than 'date'")]
+    UpdatedBeforeDate,
 }
 
 /// Wrapper around the [Error]
